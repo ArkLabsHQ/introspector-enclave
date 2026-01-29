@@ -10,6 +10,7 @@ import (
 	"github.com/arkade-os/arkd/pkg/ark-lib/intent"
 	"github.com/arkade-os/arkd/pkg/ark-lib/tree"
 	"github.com/btcsuite/btcd/btcutil/psbt"
+	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -273,11 +274,13 @@ func parseIntent(fromProto *introspectorv1.Intent) (*application.Intent, error) 
 
 	proofPsbt, err := psbt.NewFromRawBytes(strings.NewReader(proof), true)
 	if err != nil {
+		log.WithError(err).WithField("proof", proof).Debug("invalid proof")
 		return nil, fmt.Errorf("invalid proof: %w", err)
 	}
 
 	var registerMessage intent.RegisterMessage
 	if err := registerMessage.Decode(message); err != nil {
+		log.WithError(err).WithField("message", message).Debug("invalid message")
 		return nil, fmt.Errorf("invalid message: %w", err)
 	}
 

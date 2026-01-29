@@ -13,6 +13,8 @@ services:
     volumes:
       - type: tmpfs
         target: /app/data
+    depends_on:
+      - arkd
   pgnbxplorer:
     restart: unless-stopped
     image: postgres:16
@@ -58,9 +60,7 @@ services:
 
   arkd-wallet:
     restart: unless-stopped
-    build:
-      context: .
-      dockerfile: arkd-wallet.Dockerfile
+    image: ghcr.io/arkade-os/arkd-wallet:v0.8.11
     container_name: arkd-wallet
     depends_on:
       - nbxplorer
@@ -76,9 +76,7 @@ services:
       - type: tmpfs
         target: /app/data
   arkd:
-    build:
-      context: .
-      dockerfile: arkd.Dockerfile
+    image: ghcr.io/arkade-os/arkd:v0.8.11
     container_name: arkd
     restart: unless-stopped
     depends_on:

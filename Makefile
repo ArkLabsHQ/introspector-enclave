@@ -22,7 +22,7 @@ run:
 
 integrationtest:
 	@echo "Running integration test..."
-	@go test ./test/e2e_test.go
+	@go test ./test/...
 
 # docker-run: starts docker test environment
 docker-run:

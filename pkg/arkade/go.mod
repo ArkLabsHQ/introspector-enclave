@@ -1,6 +1,6 @@
 module github.com/ArkLabsHQ/introspector/pkg/arkade
 
-go 1.25.3
+go 1.25.5
 
 require (
 	github.com/arkade-os/arkd/pkg/ark-lib v0.8.0

@@ -1,5 +1,5 @@
 # First image used to build the sources
-FROM golang:1.25.3 AS builder
+FROM golang:1.25.5 AS builder
 
 ARG VERSION
 ARG TARGETOS
@@ -7,6 +7,19 @@ ARG TARGETARCH
 
 WORKDIR /app
 
+# Copy go.mod and go.sum files first for better caching
+COPY go.mod go.sum ./
+COPY api-spec/go.mod api-spec/go.sum ./api-spec/
+COPY pkg/arkade/go.mod pkg/arkade/go.sum ./pkg/arkade/
+COPY pkg/client/go.mod pkg/client/go.sum ./pkg/client/
+
+# Download dependencies
+RUN go mod download
+RUN cd api-spec && go mod download
+RUN cd pkg/arkade && go mod download
+RUN cd pkg/client && go mod download
+
+# Copy the rest of the source code
 COPY . .
 
 # ENV GOPROXY=https://goproxy.io,direct
