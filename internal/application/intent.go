@@ -42,7 +42,7 @@ func (s *service) SubmitIntent(ctx context.Context, intent Intent) (*psbt.Packet
 		if err := s.signer.signInput(ptx, inputIndex, script.hash, prevoutFetcher); err != nil {
 			return nil, fmt.Errorf("failed to sign input %d: %w", inputIndex, err)
 		}
-	
+
 	}
 
 	return ptx, nil

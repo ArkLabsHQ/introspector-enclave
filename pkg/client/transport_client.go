@@ -23,11 +23,11 @@ type TransportClient interface {
 	SubmitTx(ctx context.Context, tx string, checkpoints []string) (
 		signedTx string, signedCheckpoints []string, err error,
 	)
-	SubmitIntent(ctx context.Context, intent Intent) (signedIntent string, err error)
+	SubmitIntent(ctx context.Context, intent Intent) (signedProof string, err error)
 	SubmitFinalization(
-		ctx context.Context, 
-		intent Intent, 
-		forfeits []string, 
+		ctx context.Context,
+		intent Intent,
+		forfeits []string,
 		connectorTree, vtxoTree tree.FlatTxTree, commitmentTx string,
 	) (signedForfeits []string, signedCommitmentTx string, err error)
 }
@@ -71,7 +71,7 @@ func (c *grpcClient) SubmitTx(ctx context.Context, tx string, checkpoints []stri
 	return resp.GetSignedArkTx(), resp.GetSignedCheckpointTxs(), nil
 }
 
-func (c *grpcClient) SubmitIntent(ctx context.Context, intent Intent) (signedIntent string, err error) {
+func (c *grpcClient) SubmitIntent(ctx context.Context, intent Intent) (string, error) {
 	req := &introspectorv1.SubmitIntentRequest{
 		Intent: &introspectorv1.Intent{
 			Proof:   intent.Proof,

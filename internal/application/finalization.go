@@ -33,19 +33,19 @@ func (s *service) SubmitFinalization(ctx context.Context, finalization BatchFina
 	for _, forfeit := range finalization.Forfeits {
 		if len(forfeit.Inputs) != 2 {
 			return nil, fmt.Errorf(
-				"malformed forfeit %s: expected 2 inputs, got %d", 
+				"malformed forfeit %s: expected 2 inputs, got %d",
 				forfeit.UnsignedTx.TxID(), len(forfeit.Inputs),
 			)
 		}
 		if len(forfeit.UnsignedTx.TxIn) != 2 {
 			return nil, fmt.Errorf(
-				"malformed forfeit %s: expected 2 inputs, got %d", 
+				"malformed forfeit %s: expected 2 inputs, got %d",
 				forfeit.UnsignedTx.TxID(), len(forfeit.UnsignedTx.TxIn),
 			)
 		}
 
 		for inputIndex, input := range forfeit.UnsignedTx.TxIn {
-			arkadeScript, ok := signedInputs[input.PreviousOutPoint]; 
+			arkadeScript, ok := signedInputs[input.PreviousOutPoint]
 			if !ok {
 				continue
 			}
@@ -92,7 +92,7 @@ func (s *service) SubmitFinalization(ctx context.Context, finalization BatchFina
 	signed := false
 
 	for inputIndex, input := range finalization.CommitmentTx.UnsignedTx.TxIn {
-		arkadeScript, ok := signedInputs[input.PreviousOutPoint]; 
+		arkadeScript, ok := signedInputs[input.PreviousOutPoint]
 		if !ok {
 			continue
 		}
@@ -137,7 +137,7 @@ func getSignedInputs(ptx psbt.Packet, signerPublicKey *btcec.PublicKey) (map[wir
 		}
 
 		xOnlyPubKey := schnorr.SerializePubKey(script.pubkey)
-		
+
 		for _, sig := range input.TaprootScriptSpendSig {
 			if !bytes.Equal(sig.XOnlyPubKey, xOnlyPubKey) {
 				continue
@@ -187,8 +187,7 @@ func hasLeaf(tree *tree.TxTree, outpoint wire.OutPoint) bool {
 	}
 
 	output := node.Root.UnsignedTx.TxOut[outpoint.Index]
-	
-	// false if the output is anchor
-	return !bytes.Equal(output.PkScript, txutils.ANCHOR_PKSCRIPT) 
-}
 
+	// false if the output is anchor
+	return !bytes.Equal(output.PkScript, txutils.ANCHOR_PKSCRIPT)
+}

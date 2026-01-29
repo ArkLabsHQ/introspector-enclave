@@ -23,20 +23,20 @@ type OffchainTx struct {
 }
 
 type Intent struct {
-	Proof intent.Proof
+	Proof   intent.Proof
 	Message intent.RegisterMessage
 }
 
 type BatchFinalization struct {
-	Intent Intent
-	Forfeits []*psbt.Packet
+	Intent        Intent
+	Forfeits      []*psbt.Packet
 	ConnectorTree *tree.TxTree
-	VtxoTree *tree.TxTree
-	CommitmentTx *psbt.Packet
+	VtxoTree      *tree.TxTree
+	CommitmentTx  *psbt.Packet
 }
 
 type SignedBatchFinalization struct {
-	Forfeits []*psbt.Packet
+	Forfeits     []*psbt.Packet
 	CommitmentTx *psbt.Packet
 }
 
@@ -60,7 +60,6 @@ func New(secretKey *btcec.PrivateKey) Service {
 func (s *service) GetInfo(ctx context.Context) (*Info, error) {
 	return &Info{SignerPublicKey: s.publicKey}, nil
 }
-
 
 // TODO : do not rely on witness utxo to compute the prevout fetcher
 func computePrevoutFetcher(ptx *psbt.Packet) (txscript.PrevOutputFetcher, error) {

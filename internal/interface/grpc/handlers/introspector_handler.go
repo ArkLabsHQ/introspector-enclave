@@ -118,7 +118,7 @@ func (h *handler) SubmitIntent(
 	if err != nil {
 		return nil, status.Error(codes.Internal, "failed to encode proof")
 	}
-	
+
 	return &introspectorv1.SubmitIntentResponse{
 		SignedProof: encodedProof,
 	}, nil
@@ -141,7 +141,7 @@ func (h *handler) SubmitFinalization(
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, fmt.Sprintf("invalid signed intent: %v", err))
 	}
-	
+
 	if len(commitmentTx) <= 0 {
 		return nil, status.Error(codes.InvalidArgument, "missing commitment tx")
 	}
@@ -161,8 +161,8 @@ func (h *handler) SubmitFinalization(
 	}
 
 	batchFinalization := application.BatchFinalization{
-		Intent: *intent,
-		Forfeits: forfeitPsbt,
+		Intent:       *intent,
+		Forfeits:     forfeitPsbt,
 		CommitmentTx: commitmentPtx,
 	}
 
@@ -213,7 +213,7 @@ func (h *handler) SubmitFinalization(
 	}
 
 	return &introspectorv1.SubmitFinalizationResponse{
-		SignedForfeits: encodedForfeits,
+		SignedForfeits:     encodedForfeits,
 		SignedCommitmentTx: encodedCommitmentTx,
 	}, nil
 }
@@ -242,8 +242,8 @@ func parseTxTree(fromProto []*introspectorv1.TxTreeNode) (*tree.TxTree, error) {
 	flat := make(tree.FlatTxTree, 0)
 	for _, node := range fromProto {
 		flat = append(flat, tree.TxTreeNode{
-			Txid: node.GetTxid(),
-			Tx: node.GetTx(),
+			Txid:     node.GetTxid(),
+			Tx:       node.GetTx(),
 			Children: node.GetChildren(),
 		})
 	}
@@ -283,7 +283,7 @@ func parseIntent(fromProto *introspectorv1.Intent) (*application.Intent, error) 
 
 	intentProof := intent.Proof{Packet: *proofPsbt}
 	return &application.Intent{
-		Proof: intentProof,
+		Proof:   intentProof,
 		Message: registerMessage,
 	}, nil
 }

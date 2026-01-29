@@ -37,3 +37,9 @@ docker-stop:
 build:
 	@echo "Building introspector..."
 	@go build -o build/introspector cmd/introspector.go
+
+lint:
+	golangci-lint run --fix
+
+format:
+	gofmt -w .

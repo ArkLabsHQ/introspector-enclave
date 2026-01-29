@@ -15,10 +15,10 @@ import (
 )
 
 type arkadeScript struct {
-	script []byte
-	hash []byte
+	script  []byte
+	hash    []byte
 	witness wire.TxWitness
-	pubkey *btcec.PublicKey
+	pubkey  *btcec.PublicKey
 	tapLeaf txscript.TapLeaf
 }
 
@@ -80,17 +80,17 @@ func readArkadeScript(ptx *psbt.Packet, inputIndex int, signerPublicKey *btcec.P
 	if err != nil {
 		return nil, fmt.Errorf("unexpected error while getting arkade script witness fields: %w", err)
 	}
-	
+
 	arkadeScriptWitness := make(wire.TxWitness, 0)
 	if len(arkadeScriptWitnessFields) > 0 {
 		arkadeScriptWitness = arkadeScriptWitnessFields[0]
 	}
 
 	return &arkadeScript{
-		script: arkadescript,
-		hash: scriptHash,
+		script:  arkadescript,
+		hash:    scriptHash,
 		witness: arkadeScriptWitness,
-		pubkey: expectedPublicKey,
+		pubkey:  expectedPublicKey,
 		tapLeaf: txscript.NewBaseTapLeaf(spendingTapscript.Script),
 	}, nil
 }

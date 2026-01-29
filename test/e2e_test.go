@@ -20,8 +20,10 @@ import (
 	"github.com/ArkLabsHQ/introspector/pkg/arkade"
 	introspectorclient "github.com/ArkLabsHQ/introspector/pkg/client"
 	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
+	"github.com/arkade-os/arkd/pkg/ark-lib/intent"
 	"github.com/arkade-os/arkd/pkg/ark-lib/offchain"
 	"github.com/arkade-os/arkd/pkg/ark-lib/script"
+	"github.com/arkade-os/arkd/pkg/ark-lib/tree"
 	"github.com/arkade-os/arkd/pkg/ark-lib/txutils"
 	arksdk "github.com/arkade-os/go-sdk"
 	"github.com/arkade-os/go-sdk/client"
@@ -61,12 +63,12 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-// TestSendToArkadeScriptClosure tests sending funds to an arkade script closure
+// TestOffchain tests sending funds to an arkade script closure
 // alice onboard funds and send to an arkade script closure using introspection opcodes
 // then 2 offchain transactions are attempted:
 // 1. offchain with the wrong outputs : test if it fails
 // 2. offchain with the correct outputs : test if it succeeds
-func TestSendToArkadeScriptClosure(t *testing.T) {
+func TestOffchain(t *testing.T) {
 	ctx := context.Background()
 	alice, grpcAlice := setupArkSDK(t)
 	defer grpcAlice.Close()
@@ -187,9 +189,7 @@ func TestSendToArkadeScriptClosure(t *testing.T) {
 	require.NoError(t, err)
 
 	txid, err := alice.SendOffChain(
-		ctx,
-		false,
-		[]types.Receiver{{To: bobAddrStr, Amount: sendAmount}},
+		ctx, []types.Receiver{{To: bobAddrStr, Amount: sendAmount}},
 	)
 	require.NoError(t, err)
 	require.NotEmpty(t, txid)
@@ -322,13 +322,13 @@ func TestSendToArkadeScriptClosure(t *testing.T) {
 		encodedValidCheckpoints = append(encodedValidCheckpoints, encoded)
 	}
 
-	signedTx, signedByInterceptorCheckpoints, err := introspectorClient.SubmitTx(ctx, signedTx, encodedValidCheckpoints)
+	signedTx, signedByIntrospectorCheckpoints, err := introspectorClient.SubmitTx(ctx, signedTx, encodedValidCheckpoints)
 	require.NoError(t, err)
 
 	txid, _, signedByServerCheckpoints, err := grpcAlice.SubmitTx(ctx, signedTx, encodedValidCheckpoints)
 	require.NoError(t, err)
 
-	finalCheckpoints := make([]string, 0, len(signedByInterceptorCheckpoints))
+	finalCheckpoints := make([]string, 0, len(signedByIntrospectorCheckpoints))
 	for i, checkpoint := range signedByServerCheckpoints {
 		finalCheckpoint, err := bobWallet.SignTransaction(
 			ctx,
@@ -337,9 +337,9 @@ func TestSendToArkadeScriptClosure(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		// combine server and interceptor checkpoints
+		// combine server and introspector checkpoints
 
-		byInterceptorCheckpointPtx, err := psbt.NewFromRawBytes(strings.NewReader(signedByInterceptorCheckpoints[i]), true)
+		byInterceptorCheckpointPtx, err := psbt.NewFromRawBytes(strings.NewReader(signedByIntrospectorCheckpoints[i]), true)
 		require.NoError(t, err)
 
 		checkpointPtx, err := psbt.NewFromRawBytes(strings.NewReader(finalCheckpoint), true)
@@ -358,6 +358,271 @@ func TestSendToArkadeScriptClosure(t *testing.T) {
 
 	err = grpcAlice.FinalizeTx(ctx, txid, finalCheckpoints)
 	require.NoError(t, err)
+}
+
+func TestSettlement(t *testing.T) {
+	ctx := context.Background()
+	alice, grpcClient := setupArkSDK(t)
+	defer grpcClient.Close()
+
+	bobPrivKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+
+	configStore, err := inmemorystoreconfig.NewConfigStore()
+	require.NoError(t, err)
+
+	walletStore, err := inmemorystore.NewWalletStore()
+	require.NoError(t, err)
+
+	bobWallet, err := singlekeywallet.NewBitcoinWallet(
+		configStore,
+		walletStore,
+	)
+	require.NoError(t, err)
+
+	_, err = bobWallet.Create(ctx, password, hex.EncodeToString(bobPrivKey.Serialize()))
+	require.NoError(t, err)
+
+	_, err = bobWallet.Unlock(ctx, password)
+	require.NoError(t, err)
+
+	bobPubKey := bobPrivKey.PubKey()
+
+	// Fund Alice's account
+	_, offchainAddr, boardingAddress, err := alice.Receive(ctx)
+	require.NoError(t, err)
+
+	aliceAddr, err := arklib.DecodeAddressV0(offchainAddr)
+	require.NoError(t, err)
+
+	_, err = runCommand("nigiri", "faucet", boardingAddress)
+	require.NoError(t, err)
+
+	time.Sleep(5 * time.Second)
+
+	_, err = alice.Settle(ctx)
+	require.NoError(t, err)
+
+	time.Sleep(5 * time.Second)
+
+	const sendAmount = 10000
+
+	alicePkScript, err := script.P2TRScript(aliceAddr.VtxoTapKey)
+	require.NoError(t, err)
+
+	// script verifying that the spending tx includes an output going to alice's address
+	arkadeScript, err := txscript.NewScriptBuilder().
+		AddInt64(0).
+		AddOp(arkade.OP_INSPECTOUTPUTSCRIPTPUBKEY).
+		AddOp(arkade.OP_1).
+		AddOp(arkade.OP_EQUALVERIFY).
+		AddData(alicePkScript[2:]). // only witness program is pushed
+		AddOp(arkade.OP_EQUAL).
+		Script()
+	require.NoError(t, err)
+
+	// create the client
+	conn, err := grpc.NewClient("localhost:7073", grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	introspectorClient := introspectorclient.NewGRPCClient(conn)
+
+	introspectorInfo, err := introspectorClient.GetInfo(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, introspectorInfo)
+
+	publicKeyBytes, err := hex.DecodeString(introspectorInfo.SignerPublicKey)
+	require.NoError(t, err)
+	publicKey, err := btcec.ParsePubKey(publicKeyBytes)
+	require.NoError(t, err)
+
+	vtxoScript := script.TapscriptsVtxoScript{
+		Closures: []script.Closure{
+			&script.MultisigClosure{
+				PubKeys: []*btcec.PublicKey{
+					bobPubKey,
+					aliceAddr.Signer,
+					arkade.ComputeArkadeScriptPublicKey(
+						publicKey,
+						arkade.ArkadeScriptHash(arkadeScript),
+					),
+				},
+			},
+		},
+	}
+
+	vtxoTapKey, vtxoTapTree, err := vtxoScript.TapTree()
+	require.NoError(t, err)
+
+	closure := vtxoScript.ForfeitClosures()[0]
+
+	contractAddress := arklib.Address{
+		HRP:        "tark",
+		VtxoTapKey: vtxoTapKey,
+		Signer:     aliceAddr.Signer,
+	}
+
+	arkadeTapscript, err := closure.Script()
+	require.NoError(t, err)
+
+	merkleProof, err := vtxoTapTree.GetTaprootMerkleProof(
+		txscript.NewBaseTapLeaf(arkadeTapscript).TapHash(),
+	)
+	require.NoError(t, err)
+
+	ctrlBlock, err := txscript.ParseControlBlock(merkleProof.ControlBlock)
+	require.NoError(t, err)
+
+	tapscript := &waddrmgr.Tapscript{
+		ControlBlock:   ctrlBlock,
+		RevealedScript: merkleProof.Script,
+	}
+
+	contractAddressStr, err := contractAddress.EncodeV0()
+	require.NoError(t, err)
+
+	txid, err := alice.SendOffChain(
+		ctx, []types.Receiver{{To: contractAddressStr, Amount: sendAmount}},
+	)
+	require.NoError(t, err)
+	require.NotEmpty(t, txid)
+
+	indexerSvc := setupIndexer(t)
+
+	fundingTx, err := indexerSvc.GetVirtualTxs(ctx, []string{txid})
+	require.NoError(t, err)
+	require.NotEmpty(t, fundingTx)
+	require.Len(t, fundingTx.Txs, 1)
+
+	redeemPtx, err := psbt.NewFromRawBytes(strings.NewReader(fundingTx.Txs[0]), true)
+	require.NoError(t, err)
+
+	var contractOutput *wire.TxOut
+	var contractOutputIndex uint32
+	for i, out := range redeemPtx.UnsignedTx.TxOut {
+		if bytes.Equal(out.PkScript[2:], schnorr.SerializePubKey(contractAddress.VtxoTapKey)) {
+			contractOutput = out
+			contractOutputIndex = uint32(i)
+			break
+		}
+	}
+	require.NotNil(t, contractOutput)
+
+	// create the intent
+
+	randomKey, err := btcec.NewPrivateKey()
+	require.NoError(t, err)
+	treeSignerSession := tree.NewTreeSignerSession(randomKey)
+	require.NoError(t, err)
+
+	message, err := intent.RegisterMessage{
+		BaseMessage: intent.BaseMessage{
+			Type: intent.IntentMessageTypeRegister,
+		},
+		OnchainOutputIndexes: nil,
+		ExpireAt:             0,
+		ValidAt:              0,
+		CosignersPublicKeys:  []string{treeSignerSession.GetPublicKey()},
+	}.Encode()
+	require.NoError(t, err)
+
+	intent, err := intent.New(
+		message,
+		[]intent.Input{
+			{
+				OutPoint: &wire.OutPoint{
+					Hash:  redeemPtx.UnsignedTx.TxHash(),
+					Index: contractOutputIndex,
+				},
+				Sequence:    wire.MaxTxInSequenceNum,
+				WitnessUtxo: contractOutput,
+			},
+		},
+		[]*wire.TxOut{
+			{
+				Value:    contractOutput.Value,
+				PkScript: alicePkScript,
+			},
+		},
+	)
+	require.NoError(t, err)
+	require.NotNil(t, intent)
+	tapscripts, err := vtxoScript.Encode()
+	require.NoError(t, err)
+	taptreeField, err := txutils.VtxoTaprootTreeField.Encode(tapscripts)
+	require.NoError(t, err)
+
+	ctrlBlockBytes, err := ctrlBlock.ToBytes()
+	require.NoError(t, err)
+
+	tapLeafScript := []*psbt.TaprootTapLeafScript{
+		{
+			LeafVersion:  txscript.BaseLeafVersion,
+			ControlBlock: ctrlBlockBytes,
+			Script:       tapscript.RevealedScript,
+		},
+	}
+	intent.Inputs[0].TaprootLeafScript = tapLeafScript
+	intent.Inputs[1].TaprootLeafScript = tapLeafScript
+	intent.Inputs[0].Unknowns = append(intent.Inputs[0].Unknowns, taptreeField)
+	intent.Inputs[1].Unknowns = append(intent.Inputs[1].Unknowns, taptreeField)
+
+	encodedIntent, err := intent.B64Encode()
+	require.NoError(t, err)
+
+	explorer, err := mempoolexplorer.NewExplorer("http://localhost:3000", arklib.BitcoinRegTest)
+	require.NoError(t, err)
+
+	signedIntentProof, err := bobWallet.SignTransaction(ctx, explorer, encodedIntent)
+	require.NoError(t, err)
+
+	// SubmitIntent make the introspector execute the arkade script on the intent tx
+	// if valid, it will sign the intent and return it
+	approvedIntentProof, err := introspectorClient.SubmitIntent(ctx, introspectorclient.Intent{
+		Proof:   signedIntentProof,
+		Message: encodedIntent,
+	})
+	require.NoError(t, err)
+
+	signedIntent := introspectorclient.Intent{
+		Proof:   approvedIntentProof,
+		Message: encodedIntent,
+	}
+
+	intentId, err := grpcClient.RegisterIntent(ctx, signedIntent.Proof, signedIntent.Message)
+	require.NoError(t, err)
+
+	vtxo := client.TapscriptsVtxo{
+		Vtxo: types.Vtxo{
+			Outpoint: types.Outpoint{
+				Txid: redeemPtx.UnsignedTx.TxHash().String(),
+				VOut: contractOutputIndex,
+			},
+			Script: hex.EncodeToString(arkadeTapscript),
+			Amount: uint64(contractOutput.Value),
+		},
+		Tapscripts: tapscripts,
+	}
+
+	introspectorBatchHandler := &delegateBatchEventsHandler{
+		intentId:           intentId,
+		intent:             signedIntent,
+		vtxosToForfeit:     []client.TapscriptsVtxo{vtxo},
+		signerSession:      treeSignerSession,
+		introspectorClient: introspectorClient,
+		wallet:             bobWallet,
+		client:             grpcClient,
+	}
+
+	topics := arksdk.GetEventStreamTopics([]types.Outpoint{vtxo.Outpoint}, []tree.SignerSession{treeSignerSession})
+	eventStream, stop, err := grpcClient.GetEventStream(ctx, topics)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		stop()
+	})
+
+	commitmentTxid, err := arksdk.JoinBatchSession(ctx, eventStream, introspectorBatchHandler)
+	require.NoError(t, err)
+	require.NotEmpty(t, commitmentTxid)
 }
 
 const password = "password"
