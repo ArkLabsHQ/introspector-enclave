@@ -22,8 +22,9 @@ RUN cd pkg/client && go mod download
 # Copy the rest of the source code
 COPY . .
 
-# ENV GOPROXY=https://goproxy.io,direct
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -ldflags="-X 'main.Version=${VERSION}'" -o ./bin/introspector ./cmd/introspector.go
+RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+  go build -ldflags="-X 'main.Version=${VERSION}'" \
+  -o /app/bin/introspector-skeleton ./cmd/enclave-skeleton
 
 # Second image, running the executable
 FROM alpine:3.20
@@ -32,11 +33,12 @@ RUN apk update && apk upgrade
 
 WORKDIR /app
 
-COPY --from=builder /app/bin/* /app/
+COPY --from=builder /app/bin/introspector-skeleton /app/
+COPY enclave/start.sh /app/start.sh
 
 ENV PATH="/app:${PATH}"
 ENV INTROSPECTOR_DATADIR=/app/data
 
 VOLUME /app/data
 
-ENTRYPOINT [ "introspector" ]
+ENTRYPOINT ["/app/start.sh"]

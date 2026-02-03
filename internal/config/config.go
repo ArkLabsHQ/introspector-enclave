@@ -4,7 +4,6 @@ import (
 	"encoding/hex"
 	"fmt"
 
-	"github.com/ArkLabsHQ/introspector/internal/application"
 	arklib "github.com/arkade-os/arkd/pkg/ark-lib"
 	"github.com/btcsuite/btcd/btcec/v2"
 	log "github.com/sirupsen/logrus"
@@ -72,8 +71,4 @@ func LoadConfig() (*Config, error) {
 		TLSExtraDomains: viper.GetStringSlice(TLSExtraDomains),
 	}
 	return cfg, nil
-}
-
-func (c *Config) AppService() (application.Service, error) {
-	return application.New(c.SecretKey), nil
 }
