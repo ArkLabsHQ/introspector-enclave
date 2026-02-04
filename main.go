@@ -28,10 +28,6 @@ import (
 
 var Version = "dev"
 
-type attestationResponse struct {
-	Document string `json:"document"`
-}
-
 type getInfoResponse struct {
 	SignerPubkey string `json:"signer_pubkey"`
 	Version      string `json:"version"`
@@ -168,44 +164,6 @@ func main() {
 			SignedCommitmentTx: req.CommitmentTx,
 		})
 	})
-
-	// mux.HandleFunc("/enclave/attestation", func(w http.ResponseWriter, r *http.Request) {
-	// 	if r.Method != http.MethodGet {
-	// 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-	// 		return
-	// 	}
-	// 	nonceHex := strings.TrimSpace(r.URL.Query().Get("nonce"))
-	// 	if nonceHex == "" {
-	// 		writeError(w, http.StatusBadRequest, "nonce query parameter is required")
-	// 		return
-	// 	}
-	// 	nonceBytes, err := hex.DecodeString(nonceHex)
-	// 	if err != nil {
-	// 		writeError(w, http.StatusBadRequest, "invalid nonce hex")
-	// 		return
-	// 	}
-
-	// 	session, err := nsm.OpenDefaultSession()
-	// 	if err != nil {
-	// 		writeError(w, http.StatusInternalServerError, "failed to open NSM session")
-	// 		log.WithError(err).Error("nsm open session")
-	// 		return
-	// 	}
-	// 	defer session.Close()
-
-	// 	resp, err := session.Send(&request.Attestation{
-	// 		Nonce: nonceBytes,
-	// 	})
-	// 	if err != nil || resp.Attestation == nil {
-	// 		writeError(w, http.StatusInternalServerError, "failed to generate attestation")
-	// 		log.WithError(err).Error("nsm attestation request")
-	// 		return
-	// 	}
-
-	// 	writeJSON(w, http.StatusOK, attestationResponse{
-	// 		Document: base64.StdEncoding.EncodeToString(resp.Attestation.Document),
-	// 	})
-	// })
 
 	server := &http.Server{
 		Addr:              fmt.Sprintf(":%d", cfg.Port),

@@ -3,3 +3,6 @@ build/
 bin/
 cdk.out/
 cdk/cdk.out/
+introspector
+cdk/cdk
+cdk/cdk-app
