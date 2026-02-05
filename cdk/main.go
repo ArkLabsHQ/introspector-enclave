@@ -79,19 +79,10 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		AssetName: jsii.String("gvisor-tap-vsock"),
 	})
 
-	buildArgs := map[string]*string{
-		"VERSION":    jsii.String(deployment),
-		"TARGETOS":   jsii.String("linux"),
-		"TARGETARCH": jsii.String("amd64"),
-		"AWS_REGION": stack.Region(),
-	}
-
-	introspectorEnclaveImage := awsecrassets.NewDockerImageAsset(stack, jsii.String("enclave"), &awsecrassets.DockerImageAssetProps{
-		Directory: jsii.String(repoRoot),
-		Platform:  awsecrassets.Platform_LINUX_AMD64(),
-		File:      jsii.String("enclave/Dockerfile"),
-		AssetName: jsii.String("introspector-enclave"),
-		BuildArgs: &buildArgs,
+	// The enclave image is built by Nix (nix build .#enclave-image) before CDK deploy.
+	// TarballImageAsset uploads the pre-built, deterministic image to ECR.
+	introspectorEnclaveImage := awsecrassets.NewTarballImageAsset(stack, jsii.String("enclave"), &awsecrassets.TarballImageAssetProps{
+		TarballFile: jsii.String(repoPath("enclave-image.tar.gz")),
 	})
 
 	watchdog := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveWatchdog"), &awss3assets.AssetProps{

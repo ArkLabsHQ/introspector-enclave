@@ -6,3 +6,14 @@ cdk/cdk.out/
 introspector
 cdk/cdk
 cdk/cdk-app
+
+# Nix build outputs
+result
+result-*
+enclave-image.tar.gz
+
+# CDK outputs
+cdk-outputs.json
+
+# Temporary build artifacts
+/tmp/enclave-verify-*

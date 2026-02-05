@@ -25,6 +25,9 @@ get_output() {
   jq -r --arg stack "${stack_name}" --arg key "${key}" '.[$stack][$key] // empty' "${output}"
 }
 
+echo "[deploy] Building enclave image with Nix..."
+VERSION="${prefix}" AWS_REGION="${region}" nix build --impure .#enclave-image -o enclave-image.tar.gz
+
 echo "[deploy] Deploying stack..."
 deploy
 

@@ -41,8 +41,8 @@ Nitro Enclave
 ├── cmd/
 │   ├── watchdog/                  # Enclave lifecycle supervisor
 │   └── introspector-client/       # Test client with attestation verification
+├── flake.nix                      # Nix flake for reproducible enclave image
 ├── enclave/
-│   ├── Dockerfile                 # Multi-stage enclave image build
 │   ├── start.sh                   # Entrypoint (nitriding + viproxy + app)
 │   ├── gvproxy/                   # Network proxy for vsock forwarding
 │   └── systemd/                   # Service units for EC2 host
@@ -65,6 +65,7 @@ Request and response schemas are defined in `api-spec/protobuf/introspector/v1/s
 
 ## Prerequisites
 
+- [Nix](https://nixos.org/download/) (with flakes enabled)
 - Go 1.25.5+
 - Docker
 - AWS CLI v2 configured with appropriate credentials
@@ -90,6 +91,7 @@ export CDK_PREFIX=dev  # optional, defaults to "dev"
 
 This script:
 
+- Builds the enclave image with Nix (`nix build .#enclave-image`)
 - Deploys the CDK stack (VPC, EC2, KMS key, ECR images, systemd services)
 - Waits for the EC2 instance and enclave to come up
 - Generates a random 32-byte signing key
@@ -127,6 +129,60 @@ go run ./cmd/introspector-client \
 ```
 
 Use `-insecure` to skip TLS verification during development.
+
+## Reproducible Build Verification
+
+The enclave image is built with [Nix](https://nixos.org/) using `dockerTools.buildImage`, which produces a byte-identical Docker image on every build. This eliminates non-determinism from Docker layer ordering and guarantees identical PCR0 measurements.
+
+### Build the enclave image
+
+```sh
+VERSION=dev AWS_REGION=us-east-1 nix build --impure .#enclave-image
+```
+
+This produces a Docker image tarball at `./result`. Load it with:
+
+```sh
+docker load < result
+```
+
+### Verify a running enclave
+
+The client builds the Docker image locally with Nix, then runs `nitro-cli build-enclave` **remotely on the EC2 instance** via SSM to derive the PCR0. This ensures the EIF is built with Amazon's official `nitro-cli` package (whose bundled kernel/init blobs determine the PCR0), matching what the deployment uses.
+
+```sh
+go run ./cmd/introspector-client \
+  --base-url https://<enclave-host> \
+  --verify-build \
+  --instance-id <ec2-instance-id> \
+  --s3-bucket <bucket-for-image-upload> \
+  --repo-path /path/to/introspector-enclave \
+  --build-version dev \
+  --build-region us-east-1 \
+  --insecure
+```
+
+This will:
+1. Run `nix build .#enclave-image` locally to produce a deterministic Docker image tarball
+2. Upload the tarball to S3 so the EC2 instance can fetch it
+3. Run an SSM command on the instance to download the image, load it into Docker, and run `nitro-cli build-enclave` to derive PCR0
+4. Fetch the attestation document from the running enclave
+5. Verify the attestation signature, nonce, and PCR0 match
+6. Clean up the S3 object
+
+The `--build-version` flag must match the `VERSION` used by the operator (the CDK deployment uses the `CDK_PREFIX` value, which defaults to `dev`).
+
+### Using the deploy script
+
+```sh
+VERIFY_BUILD=1 BUILD_VERSION=dev INSECURE_TLS=1 ./scripts/deploy_and_call.sh
+```
+
+The script auto-detects the S3 bucket from the CDK assets bucket (`cdk-hnb659fds-assets-<account>-<region>`). Override with `S3_BUCKET` if needed.
+
+### Prerequisites for build verification
+
+`--verify-build` requires `nix` and `aws` CLI in PATH locally. The `nitro-cli` is **not** needed locally -- it runs on the EC2 instance via SSM. The instance must have SSM agent running and the `aws-nitro-enclaves-cli` package installed (both are configured by the CDK stack's user data).
 
 ## Configuration
 
