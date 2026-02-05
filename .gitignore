@@ -15,5 +15,9 @@ enclave-image.tar.gz
 # CDK outputs
 cdk-outputs.json
 
+# Built binaries
+introspector-client
+*.eif
+
 # Temporary build artifacts
 /tmp/enclave-verify-*
