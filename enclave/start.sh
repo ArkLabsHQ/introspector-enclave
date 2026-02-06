@@ -2,6 +2,7 @@
 
 set -e
 
+# Start viproxy for IMDS access before nitriding sets up full networking
 if [ "${INTROSPECTOR_VIPROXY_ENABLED:-true}" = "true" ]; then
   VIPROXY_IN_ADDRS="${INTROSPECTOR_VIPROXY_IN_ADDRS:-127.0.0.1:80}"
   VIPROXY_OUT_ADDRS="${INTROSPECTOR_VIPROXY_OUT_ADDRS:-3:8002}"
@@ -36,4 +37,8 @@ if [ "${INTROSPECTOR_NITRIDING_DEBUG:-false}" = "true" ]; then
   NITRIDING_ARGS="${NITRIDING_ARGS} -debug"
 fi
 
+# Configure DNS to use gvproxy gateway
+echo "nameserver 192.168.127.1" > /etc/resolv.conf
+
+# Start nitriding in background (it will set up networking via gvproxy)
 exec /app/nitriding ${NITRIDING_ARGS} -appcmd "/app/introspector-skeleton"

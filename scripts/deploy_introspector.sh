@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Deploys the Nitro Introspector stack, generates a secret key, encrypts it with KMS,
-# rebuilds the enclave image with the ciphertext baked in, and applies the attestation key policy.
+# Deploys the Nitro Introspector stack with a pre-built reproducible EIF.
+# Applies KMS policy with PCR0 from build BEFORE the enclave starts, ensuring
+# the policy is in place before any decrypt operations.
 set -euo pipefail
 export AWS_PAGER=""
 
@@ -16,96 +17,131 @@ fi
 
 stack_name="${prefix}NitroIntrospector"
 
-deploy() {
-  cdk deploy -O "${output}"
-}
-
 get_output() {
   local key=$1
   jq -r --arg stack "${stack_name}" --arg key "${key}" '.[$stack][$key] // empty' "${output}"
 }
 
-echo "[deploy] Building enclave image with Nix..."
-VERSION="${prefix}" AWS_REGION="${region}" nix build --impure .#enclave-image -o enclave-image.tar.gz
+# Apply KMS key policy with PCR0 attestation condition
+apply_kms_policy() {
+  local key_id=$1
+  local pcr0=$2
+  local ec2_role_arn=$3
+  local account_root="arn:aws:iam::${account}:root"
 
+  echo "[deploy] Applying KMS key policy with PCR0: ${pcr0}"
+
+  local policy
+  policy=$(cat <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "Enable decrypt from enclave with attestation",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${ec2_role_arn}"},
+      "Action": "kms:Decrypt",
+      "Resource": "*",
+      "Condition": {
+        "StringEqualsIgnoreCase": {
+          "kms:RecipientAttestation:PCR0": "${pcr0}"
+        }
+      }
+    },
+    {
+      "Sid": "Enable encrypt from enclave",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${ec2_role_arn}"},
+      "Action": "kms:Encrypt",
+      "Resource": "*"
+    },
+    {
+      "Sid": "Enable root account full access",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${account_root}"},
+      "Action": "kms:*",
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+  )
+
+  aws kms put-key-policy \
+    --region "${region}" \
+    --key-id "${key_id}" \
+    --policy-name default \
+    --policy "${policy}"
+}
+
+# Step 1: Build EIF and get PCR0 from build output
+echo "[deploy] Building EIF with Nix (reproducible build)..."
+VERSION="${prefix}" AWS_REGION="${region}" nix build --impure .#eif
+
+# Get PCR0 from Nix build output (deterministic, known before deployment)
+pcr0=$(jq -r '.PCR0' result/pcr.json)
+if [[ -z "${pcr0}" || "${pcr0}" == "null" ]]; then
+  echo "Failed to get PCR0 from result/pcr.json" >&2
+  exit 1
+fi
+echo "[deploy] PCR0 from build: ${pcr0}"
+
+# Step 2: Deploy the stack (creates KMS key, EC2 instance, role)
 echo "[deploy] Deploying stack..."
-deploy
+cdk deploy -O "${output}"
 
+# Step 3: Get outputs and apply KMS policy IMMEDIATELY (before enclave fully starts)
 kms_key_id=$(get_output "KMSKeyID")
 if [[ -z "${kms_key_id}" ]]; then
   kms_key_id=$(get_output "KmsKeyId")
 fi
-
 if [[ -z "${kms_key_id}" ]]; then
   echo "KMSKeyID not found in ${output} for ${stack_name}" >&2
   exit 1
 fi
 
+ec2_role_arn=$(get_output "EC2InstanceRoleARN")
+if [[ -z "${ec2_role_arn}" ]]; then
+  echo "EC2InstanceRoleARN not found in ${output} for ${stack_name}" >&2
+  exit 1
+fi
+
+instance_id=$(get_output "InstanceID")
+if [[ -z "${instance_id}" ]]; then
+  instance_id=$(get_output "InstanceId")
+fi
+if [[ -z "${instance_id}" ]]; then
+  echo "InstanceID not found in ${output} for ${stack_name}" >&2
+  exit 1
+fi
+
+# Wait for KMS key to be enabled
 echo "[deploy] Waiting for KMS key ${kms_key_id} to be enabled..."
 for _ in {1..60}; do
   key_state=$(aws kms describe-key --region "${region}" --key-id "${kms_key_id}" --query 'KeyMetadata.KeyState' --output text)
   if [[ "${key_state}" == "Enabled" ]]; then
     break
   fi
-  sleep 5
+  sleep 2
 done
 
-instance_id=$(get_output "InstanceID")
-if [[ -z "${instance_id}" ]]; then
-  instance_id=$(get_output "InstanceId")
-fi
+# Apply KMS policy with PCR0 BEFORE waiting for instance/enclave
+# This ensures the policy is in place before any decrypt operations
+apply_kms_policy "${kms_key_id}" "${pcr0}" "${ec2_role_arn}"
 
-if [[ -z "${instance_id}" ]]; then
-  echo "InstanceID not found in ${output} for ${stack_name}" >&2
-  exit 1
-fi
-
+# Step 4: Wait for instance to be ready
 echo "[deploy] Waiting for instance ${instance_id} to be ready..."
 aws ec2 wait instance-status-ok --region "${region}" --instance-ids "${instance_id}"
 
-echo "[deploy] Waiting for enclave to be running on ${instance_id}..."
-max_attempts=60
-for attempt in $(seq 1 $max_attempts); do
-  if pcr0_out=$(./scripts/get_pcr0.sh "${instance_id}" 2>/dev/null) && [[ -n "${pcr0_out}" ]]; then
-    echo "[deploy] Enclave is running (PCR0: ${pcr0_out:0:16}...)"
-    break
-  fi
-  if [[ $attempt -eq $max_attempts ]]; then
-    echo "Enclave did not start after ${max_attempts} attempts" >&2
-    exit 1
-  fi
-  echo "[deploy] Enclave not ready yet (attempt ${attempt}/${max_attempts}), waiting 30s..."
-  sleep 30
-done
-
-echo "[deploy] Applying KMS key policy with enclave PCR0..."
-./scripts/generate_kms_key_policy.sh "${output}" >/tmp/introspector_kms_policy.json
-
-secret_hex=$(openssl rand -hex 32)
-secret_bin=$(mktemp)
-trap 'rm -f "${secret_bin}"' EXIT
-echo -n "${secret_hex}" | xxd -r -p > "${secret_bin}"
-
-echo "[deploy] Encrypting secret key with KMS..."
-ciphertext_b64=$(aws kms encrypt \
-  --region "${region}" \
-  --key-id "${kms_key_id}" \
-  --plaintext "fileb://${secret_bin}" \
-  --query CiphertextBlob \
-  --output text)
-
-param_name=$(get_output "SecretKeyCiphertextParam")
-if [[ -z "${param_name}" ]]; then
-  param_name="/${prefix}/NitroIntrospector/SecretKeyCiphertext"
-fi
-
-echo "[deploy] Storing ciphertext in SSM parameter ${param_name}..."
-aws ssm put-parameter \
-  --region "${region}" \
-  --name "${param_name}" \
-  --type String \
-  --overwrite \
-  --value "${ciphertext_b64}"
-
+echo ""
 echo "[deploy] Done."
-echo "INTROSPECTOR_SECRET_KEY (hex): ${secret_hex}"
+echo "Instance ID: ${instance_id}"
+echo "KMS Key ID: ${kms_key_id}"
+echo "PCR0: ${pcr0}"
+echo ""
+echo "The enclave workflow:"
+echo "  1. KMS policy with PCR0 is already applied (done above)"
+echo "  2. First run: Generate key, encrypt with KMS, store ciphertext in SSM"
+echo "  3. Subsequent runs: Decrypt ciphertext from SSM using KMS with attestation"
+echo ""
+echo "The PCR0 policy ensures only this specific enclave image can decrypt the key."

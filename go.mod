@@ -9,8 +9,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/config v1.32.7
 	github.com/aws/aws-sdk-go-v2/service/kms v1.49.5
 	github.com/aws/aws-sdk-go-v2/service/ssm v1.56.4
+	github.com/aws/aws-sdk-go-v2/service/sts v1.41.6
 	github.com/btcsuite/btcd/btcec/v2 v2.3.5
 	github.com/edgebitio/nitro-enclaves-sdk-go v1.0.0
+	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/hf/nitrite v0.0.0-20241225144000-c2d5d3c4f303
 	github.com/hf/nsm v0.0.0-20220930140112-cd181bd646b9
 	github.com/sirupsen/logrus v1.9.3
@@ -28,12 +30,10 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/signin v1.0.5 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.9 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.13 // indirect
-	github.com/aws/aws-sdk-go-v2/service/sts v1.41.6 // indirect
 	github.com/aws/smithy-go v1.24.0 // indirect
 	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/decred/dcrd/dcrec/secp256k1/v4 v4.4.0 // indirect
 	github.com/fsnotify/fsnotify v1.9.0 // indirect
-	github.com/fxamacker/cbor/v2 v2.4.0 // indirect
 	github.com/go-viper/mapstructure/v2 v2.4.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect

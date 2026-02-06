@@ -21,3 +21,6 @@ introspector-client
 
 # Temporary build artifacts
 /tmp/enclave-verify-*
+
+# Go vendor directory
+vendor/

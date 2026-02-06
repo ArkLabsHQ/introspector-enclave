@@ -79,10 +79,10 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		AssetName: jsii.String("gvisor-tap-vsock"),
 	})
 
-	// The enclave image is built by Nix (nix build .#enclave-image) before CDK deploy.
-	// TarballImageAsset uploads the pre-built, deterministic image to ECR.
-	introspectorEnclaveImage := awsecrassets.NewTarballImageAsset(stack, jsii.String("enclave"), &awsecrassets.TarballImageAssetProps{
-		TarballFile: jsii.String(repoPath("enclave-image.tar.gz")),
+	// The EIF is built by Nix (nix build .#eif) before CDK deploy.
+	// Upload the pre-built, reproducible EIF to S3.
+	enclaveEif := awss3assets.NewAsset(stack, jsii.String("EnclaveEIF"), &awss3assets.AssetProps{
+		Path: jsii.String(repoPath("result/image.eif")),
 	})
 
 	watchdog := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveWatchdog"), &awss3assets.AssetProps{
@@ -202,6 +202,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	imdsSystemd.GrantRead(role)
 	gvproxySystemd.GrantRead(role)
 	secretCiphertextParam.GrantRead(role)
+	secretCiphertextParam.GrantWrite(role)
 
 	blockDevice := awsec2.BlockDevice{
 		DeviceName: jsii.String("/dev/xvda"),
@@ -215,19 +216,23 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	mappings := map[string]*string{
 		"__DEV_MODE__":                jsii.String(deployment),
 		"__GVPROXY_IMAGE_URI__":       outboundProxyImage.ImageUri(),
-		"__ENCLAVE_IMAGE_URI__":       introspectorEnclaveImage.ImageUri(),
+		"__EIF_S3_URL__":              enclaveEif.S3ObjectUrl(),
 		"__WATCHDOG_S3_URL__":         watchdog.S3ObjectUrl(),
 		"__WATCHDOG_SYSTEMD_S3_URL__": watchdogSystemd.S3ObjectUrl(),
 		"__IMDS_SYSTEMD_S3_URL__":     imdsSystemd.S3ObjectUrl(),
 		"__GVPROXY_SYSTEMD_S3_URL__":  gvproxySystemd.S3ObjectUrl(),
 		"__REGION__":                  stack.Region(),
+		"__KMS_KEY_ID__":              encryptionKey.KeyId(),
 	}
 
 	userDataRaw := awscdk.Fn_Sub(jsii.String(readFileOrPanic(repoPath("user_data/user_data"))), &mappings)
 
-	introspectorEnclaveImage.Repository().GrantPull(role)
+	enclaveEif.GrantRead(role)
 	outboundProxyImage.Repository().GrantPull(role)
 	encryptionKey.GrantEncryptDecrypt(role)
+
+	// NOTE: KMS key policy is applied externally by the deploy script using PCR0 from the running enclave.
+	// The EC2 role only needs Encrypt/Decrypt, not PutKeyPolicy.
 
 	instance := awsec2.NewInstance(stack, jsii.String("NitroInstance"), &awsec2.InstanceProps{
 		InstanceType: awsec2.NewInstanceType(jsii.String("m6i.xlarge")),
@@ -246,10 +251,11 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	cfnInstance := instance.Node().DefaultChild().(awsec2.CfnInstance)
 	cfnInstance.AddPropertyOverride(jsii.String("EnclaveOptions.Enabled"), jsii.Bool(true))
 
-	awsssm.NewStringParameter(stack, jsii.String("KMSKeyID"), &awsssm.StringParameterProps{
+	kmsKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("KMSKeyID"), &awsssm.StringParameterProps{
 		StringValue:   encryptionKey.KeyId(),
 		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/KMSKeyID", deployment)),
 	})
+	kmsKeyIDParam.GrantRead(role)
 
 	awscdk.NewCfnOutput(stack, jsii.String("EC2 Instance Role ARN"), &awscdk.CfnOutputProps{
 		Value:       role.RoleArn(),

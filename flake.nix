@@ -4,15 +4,17 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    aws-nitro-util.url = "github:monzo/aws-nitro-util";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, aws-nitro-util }:
     flake-utils.lib.eachSystem [ "x86_64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
+        nitro = aws-nitro-util.lib.${system};
 
         # Pass VERSION and AWS_REGION via environment when building:
-        #   VERSION=dev AWS_REGION=us-east-1 nix build --impure .#enclave-image
+        #   VERSION=dev AWS_REGION=us-east-1 nix build --impure .#eif
         version = let v = builtins.getEnv "VERSION"; in if v == "" then "dev" else v;
         region = let r = builtins.getEnv "AWS_REGION"; in if r == "" then "us-east-1" else r;
 
@@ -34,13 +36,13 @@
           pname = "introspector-skeleton";
           inherit version src;
 
-          vendorHash = "sha256-u96n5gzvEdtVy8h78XgnU2vGjexdsJC4j+MKD7FblJw=";
+          vendorHash = "sha256-0MjCpjOOt1T/vNpUXEHSDj+gjzNOXZTZzUti36JF3cA=";
 
           subPackages = [ "." ];
           env.CGO_ENABLED = "0";
           ldflags = [ "-X" "main.Version=${version}" ];
 
-          # Deterministic build flags matching the original Dockerfile.
+          # Deterministic build flags.
           buildFlags = [ "-trimpath" ];
           tags = [ "netgo" ];
         };
@@ -61,7 +63,7 @@
 
           env.CGO_ENABLED = "0";
           buildFlags = [ "-trimpath" ];
-          doCheck = false; # tests require network access
+          doCheck = false;
 
           postInstall = ''
             mv $out/bin/nitriding-daemon $out/bin/nitriding
@@ -99,22 +101,49 @@
           install -m 0755 ${./enclave/start.sh} $out/app/start.sh
         '';
 
-        # Docker image for nitro-cli build-enclave.
-        # dockerTools.buildImage produces a deterministic, single-layer image.
+        # Complete rootfs for the enclave.
+        enclaveRootfs = pkgs.buildEnv {
+          name = "enclave-rootfs";
+          paths = [
+            appDir
+            pkgs.busybox    # provides /bin/sh and basic utils
+            pkgs.cacert     # TLS CA certificates
+          ];
+          pathsToLink = [ "/" ];
+        };
+
+        # Environment variables for the enclave.
+        enclaveEnv = ''
+          PATH=/app:/bin:/usr/bin
+          INTROSPECTOR_DATADIR=/app/data
+          INTROSPECTOR_DEPLOYMENT=${version}
+          INTROSPECTOR_AWS_REGION=${region}
+          AWS_REGION=${region}
+          SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
+        '';
+
+        # Build EIF using monzo/aws-nitro-util (reproducible, no Docker).
+        eif = nitro.buildEif {
+          name = "introspector-enclave";
+          inherit version;
+
+          arch = "x86_64";
+          kernel = nitro.blobs.x86_64.kernel;
+          kernelConfig = nitro.blobs.x86_64.kernelConfig;
+          nsmKo = nitro.blobs.x86_64.nsmKo;
+
+          copyToRoot = enclaveRootfs;
+          entrypoint = "/app/start.sh";
+          env = enclaveEnv;
+        };
+
+        # Docker image (legacy, for comparison with nitro-cli build-enclave).
         enclave-image = pkgs.dockerTools.buildImage {
           name = "introspector-enclave";
           tag = "nix";
           created = "2024-01-01T00:00:00Z";
 
-          copyToRoot = pkgs.buildEnv {
-            name = "enclave-root";
-            paths = [
-              appDir
-              pkgs.busybox    # provides /bin/sh and basic utils
-              pkgs.cacert     # TLS CA certificates
-            ];
-            pathsToLink = [ "/" ];
-          };
+          copyToRoot = enclaveRootfs;
 
           config = {
             Entrypoint = [ "/app/start.sh" ];
@@ -132,8 +161,8 @@
       in
       {
         packages = {
-          inherit introspector nitriding viproxy enclave-image;
-          default = enclave-image;
+          inherit introspector nitriding viproxy enclave-image eif;
+          default = eif;
         };
       }
     );

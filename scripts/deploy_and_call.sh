@@ -30,22 +30,9 @@ if [[ -z "${BASE_URL:-}" ]]; then
     exit 1
   fi
   base_url="https://${public_ip}"
+  echo "Instance IP: ${public_ip}"
 else
   base_url="${BASE_URL}"
-fi
-
-if [[ -n "${S3_BUCKET:-}" ]]; then
-  s3_bucket="${S3_BUCKET}"
-else
-  s3_bucket=$(aws cloudformation describe-stacks \
-    --region "${region}" \
-    --stack-name CDKToolkit \
-    --query 'Stacks[0].Outputs[?OutputKey==`BucketName`].OutputValue' \
-    --output text 2>/dev/null)
-  if [[ -z "${s3_bucket}" ]]; then
-    echo "Could not determine S3 bucket from CDKToolkit stack. Set S3_BUCKET explicitly." >&2
-    exit 1
-  fi
 fi
 
 echo "[client] calling ${base_url}"
@@ -56,6 +43,6 @@ go run ./cmd/introspector-client \
   --checkpoint-tx "${CHECKPOINT_TX:-demo-checkpoint-tx}" \
   ${EXPECTED_PCR0:+--expected-pcr0 "${EXPECTED_PCR0}"} \
   ${INSECURE_TLS:+--insecure} \
-  ${VERIFY_BUILD:+--verify-build --repo-path . --instance-id "${instance_id}" --s3-bucket "${s3_bucket}"} \
+  ${VERIFY_BUILD:+--verify-build --repo-path .} \
   ${BUILD_VERSION:+--build-version "${BUILD_VERSION}"} \
-  ${VERIFY_BUILD:+--build-region "${region}"}
+  ${BUILD_REGION:+--build-region "${BUILD_REGION}"}
