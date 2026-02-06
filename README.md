@@ -7,19 +7,29 @@ A skeleton implementation of an Ark transaction-signing service running inside a
 ## Architecture
 
 ```
-Client
-  |
-  | HTTPS (port 443)
-  v
-EC2 Instance (m6i.xlarge, Amazon Linux 2023)
-  |
-  |  vsock
-  v
-Nitro Enclave
-  ├── nitriding        (TLS termination + reverse proxy)
+Client                                  AWS Services (KMS, SSM)
+  |                                              ^
+  | HTTPS (port 443)                             |
+  v                                              |
+EC2 Instance (m6i.xlarge, Amazon Linux 2023)     |
+  |                                              |
+  |  vsock:1024                          gvproxy (Docker)
+  v                                       192.168.127.1
+Nitro Enclave ---------------------------------->+
+  ├── nitriding        (TLS termination + TAP interface setup)
   ├── introspector     (HTTP API, port 7073)
-  └── viproxy          (IMDS/metadata forwarding)
+  └── viproxy          (IMDS forwarding → vsock CID 3:8002)
 ```
+
+**Networking:**
+
+The enclave uses [gvproxy](https://github.com/containers/gvisor-tap-vsock) for outbound network connectivity:
+
+- `192.168.127.1` - Gateway/DNS server (gvproxy)
+- `192.168.127.2` - Enclave's virtual IP for inbound connections
+- `127.0.0.1:80` - IMDS endpoint (via viproxy → vsock CID 3:8002)
+
+The enclave's `/etc/resolv.conf` is configured to use `192.168.127.1` for DNS resolution, enabling calls to AWS services (KMS, SSM) through gvproxy.
 
 **Key flow:**
 
