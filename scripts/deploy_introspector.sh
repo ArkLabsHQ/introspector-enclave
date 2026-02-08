@@ -56,10 +56,23 @@ apply_kms_policy() {
       "Resource": "*"
     },
     {
-      "Sid": "Enable root account full access",
+      "Sid": "Enable key administration (no decrypt)",
       "Effect": "Allow",
       "Principal": {"AWS": "${account_root}"},
-      "Action": "kms:*",
+      "Action": [
+        "kms:DescribeKey",
+        "kms:GetKeyPolicy",
+        "kms:GetKeyRotationStatus",
+        "kms:ListResourceTags",
+        "kms:PutKeyPolicy",
+        "kms:EnableKeyRotation",
+        "kms:DisableKeyRotation",
+        "kms:TagResource",
+        "kms:UntagResource",
+        "kms:ScheduleKeyDeletion",
+        "kms:CancelKeyDeletion",
+        "kms:Encrypt"
+      ],
       "Resource": "*"
     }
   ]

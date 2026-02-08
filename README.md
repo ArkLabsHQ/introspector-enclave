@@ -1,8 +1,6 @@
-# Nitro Introspector Enclave
+# Introspector Enclave
 
-A skeleton implementation of an Ark transaction-signing service running inside an [AWS Nitro Enclave](https://aws.amazon.com/ec2/nitro/nitro-enclaves/). The enclave isolates the signing key so it is never exposed to the host instance. Key material is encrypted with AWS KMS and can only be decrypted by an enclave whose attestation document matches a pre-configured PCR0 hash.
-
-> **Note:** This is a skeleton. All signing endpoints echo their inputs back unchanged. Replace the stub handlers in `main.go` with real signing logic to make it production-ready.
+An [AWS Nitro Enclave](https://aws.amazon.com/ec2/nitro/nitro-enclaves/) wrapper for the [Ark introspector](https://github.com/ArkLabsHQ/introspector) signing oracle. The enclave isolates the signing key so it is never exposed to the host instance. Key material is generated inside the enclave, encrypted with AWS KMS, and can only be decrypted by an enclave whose attestation document matches a pre-configured PCR0 measurement.
 
 ## Architecture
 
@@ -16,72 +14,114 @@ EC2 Instance (m6i.xlarge, Amazon Linux 2023)     |
   |  vsock:1024                          gvproxy (Docker)
   v                                       192.168.127.1
 Nitro Enclave ---------------------------------->+
-  ├── nitriding        (TLS termination + TAP interface setup)
-  ├── introspector     (HTTP API, port 7073)
-  └── viproxy          (IMDS forwarding → vsock CID 3:8002)
+  ├── nitriding             (TLS termination + attestation)
+  ├── introspector-init     (KMS decrypt + pubkey attestation + exec)
+  ├── introspector          (upstream signing service, port 7073)
+  └── viproxy               (IMDS forwarding -> vsock CID 3:8002)
 ```
 
-**Networking:**
+### Boot Sequence
+
+1. **nitriding** starts and sets up the TAP network interface via gvproxy
+2. **introspector-init** runs as the app command:
+   - Decrypts the signing key from KMS using a Nitro attestation document (PCR0-bound)
+   - Derives the public key and registers `SHA256(compressedPubkey)` with nitriding via `POST /enclave/hash`
+   - Signals readiness to nitriding via `GET /enclave/ready`
+   - `syscall.Exec`s the real **introspector** binary, replacing itself
+3. **introspector** (upstream) starts serving the full gRPC + HTTP signing API on port 7073, reading `INTROSPECTOR_SECRET_KEY` from the environment
+
+### Networking
 
 The enclave uses [gvproxy](https://github.com/containers/gvisor-tap-vsock) for outbound network connectivity:
 
 - `192.168.127.1` - Gateway/DNS server (gvproxy)
 - `192.168.127.2` - Enclave's virtual IP for inbound connections
-- `127.0.0.1:80` - IMDS endpoint (via viproxy → vsock CID 3:8002)
+- `127.0.0.1:80` - IMDS endpoint (via viproxy -> vsock CID 3:8002)
 
-The enclave's `/etc/resolv.conf` is configured to use `192.168.127.1` for DNS resolution, enabling calls to AWS services (KMS, SSM) through gvproxy.
+## Security Model
 
-**Key flow:**
+### Key Lifecycle
 
-1. On boot the enclave calls KMS `Decrypt` with a Nitro attestation document attached.
-2. KMS validates the attestation (PCR0) and returns the decrypted signing key.
-3. The introspector HTTP server starts and exposes the API behind nitriding.
+1. On first boot, the enclave generates a random 32-byte signing key **inside the enclave**
+2. The key is encrypted with KMS (attaching a Nitro attestation document) and stored as ciphertext in SSM Parameter Store
+3. On subsequent boots, the ciphertext is loaded from SSM and decrypted via KMS (which validates the attestation PCR0)
+4. The plaintext key only ever exists inside the enclave memory
+
+### KMS Policy
+
+The deploy script applies a KMS key policy where:
+
+- The **admin statement** explicitly excludes `kms:Decrypt` and `kms:CreateGrant` -- nobody outside the enclave can decrypt
+- The **enclave statement** allows `kms:Decrypt` only when `kms:RecipientAttestation:PCR0` matches the enclave measurement
+
+### Irreversible KMS Lockdown
+
+For maximum security, `scripts/lock_kms_policy.sh` applies an **irreversible** policy using `--bypass-policy-lockout-safety-check`:
+
+- Removes all admin access (no `kms:PutKeyPolicy`, no `kms:ScheduleKeyDeletion`)
+- Only the enclave with the exact PCR0 can call `kms:Decrypt`
+- **This cannot be undone.** Not even the AWS root account can modify the policy afterward.
+
+```sh
+# After building and deploying:
+./scripts/lock_kms_policy.sh
+```
+
+### Pubkey Attestation
+
+The signing public key is cryptographically bound to the enclave's attestation:
+
+1. `introspector-init` computes `SHA256(compressedPubkey)` and sends it to nitriding's `/enclave/hash` endpoint
+2. Nitriding includes this hash in the `UserData` field of all subsequent attestation documents
+3. Clients fetch the attestation document and `/v1/info` pubkey, then verify the hash matches
+
+This ensures the pubkey returned by the API genuinely belongs to the attested enclave.
 
 ## Project Structure
 
 ```
 .
-├── main.go                        # HTTP server and KMS key loading
+├── main.go                        # introspector-init: KMS decrypt + pubkey registration + exec
+├── kms_ssm.go                     # KMS encrypt/decrypt with attestation, SSM storage
+├── imds.go                        # IMDS credential fetching via viproxy
 ├── internal/config/               # Configuration (env vars via viper)
-├── api-spec/
-│   ├── protobuf/                  # gRPC/protobuf service definitions
-│   └── openapi/                   # Generated OpenAPI spec
-├── cdk/
-│   └── main.go                    # AWS CDK infrastructure (VPC, EC2, KMS, IAM)
 ├── cmd/
 │   ├── watchdog/                  # Enclave lifecycle supervisor
-│   └── introspector-client/       # Test client with attestation verification
-├── flake.nix                      # Nix flake for reproducible enclave image
+│   └── introspector-client/       # Client with attestation + pubkey verification
+├── flake.nix                      # Nix flake: reproducible EIF build
 ├── enclave/
-│   ├── start.sh                   # Entrypoint (nitriding + viproxy + app)
+│   ├── start.sh                   # Entrypoint (viproxy + nitriding + introspector-init)
 │   ├── gvproxy/                   # Network proxy for vsock forwarding
 │   └── systemd/                   # Service units for EC2 host
-├── scripts/                       # Deployment and key setup scripts
+├── scripts/
+│   ├── deploy_introspector.sh     # Full deployment (CDK + key setup + KMS policy)
+│   ├── lock_kms_policy.sh         # Irreversible KMS lockdown (PCR0-only decrypt)
+│   └── setup_keys.sh              # Key setup only (stack already deployed)
+├── cdk/                           # AWS CDK infrastructure (VPC, EC2, KMS, IAM)
 └── user_data/                     # EC2 cloud-init user data
 ```
 
 ## API Endpoints
 
-All endpoints are served behind [nitriding](https://github.com/brave/nitriding-daemon) on port 443.
+All endpoints are served behind [nitriding](https://github.com/brave/nitriding-daemon) on port 443 with automatic TLS.
 
-| Method | Path                | Description                                |
-|--------|---------------------|--------------------------------------------|
-| GET    | `/v1/info`          | Returns signer public key and version      |
-| POST   | `/v1/tx`            | Submit Ark + checkpoint transactions       |
-| POST   | `/v1/intent`        | Submit a signed intent proof               |
-| POST   | `/v1/finalization`  | Submit forfeits and commitment for signing |
+| Method | Path                       | Description                                      |
+|--------|----------------------------|--------------------------------------------------|
+| GET    | `/enclave/attestation`     | Nitro attestation document (nitriding)            |
+| GET    | `/v1/info`                 | Returns signer public key and version             |
+| POST   | `/v1/tx`                   | Submit Ark + checkpoint transactions for signing  |
+| POST   | `/v1/intent`               | Submit a signed intent proof                      |
+| POST   | `/v1/finalization`         | Submit forfeits and commitment for signing        |
 
 Request and response schemas are defined in `api-spec/protobuf/introspector/v1/service.proto`.
 
 ## Prerequisites
 
-- [Nix](https://nixos.org/download/) (with flakes enabled)
-- Go 1.25.5+
-- Docker
+- [Nix](https://nixos.org/download/) with flakes enabled
 - AWS CLI v2 configured with appropriate credentials
 - AWS CDK CLI (`npm install -g aws-cdk`)
 - An AWS account with permissions for EC2, KMS, SSM, ECR, VPC, and IAM
-- `jq`, `openssl`, `xxd`
+- `jq`
 
 ## Deployment
 
@@ -93,7 +133,15 @@ export CDK_DEPLOY_ACCOUNT=<your-account-id>
 export CDK_PREFIX=dev  # optional, defaults to "dev"
 ```
 
-### 2. Full deploy (infrastructure + key setup)
+### 2. Build the enclave image
+
+```sh
+VERSION=dev AWS_REGION=us-east-1 nix build --impure .#eif
+```
+
+This produces `result/image.eif` and `result/pcr.json` with the PCR0 measurement.
+
+### 3. Deploy infrastructure + set up keys
 
 ```sh
 ./scripts/deploy_introspector.sh
@@ -101,64 +149,45 @@ export CDK_PREFIX=dev  # optional, defaults to "dev"
 
 This script:
 
-- Builds the enclave image with Nix (`nix build .#enclave-image`)
 - Deploys the CDK stack (VPC, EC2, KMS key, ECR images, systemd services)
 - Waits for the EC2 instance and enclave to come up
-- Generates a random 32-byte signing key
-- Encrypts it with KMS and stores the ciphertext in SSM
+- The enclave generates a signing key on first boot
 - Applies a KMS key policy restricting decryption to the enclave's PCR0
 
-### 3. Key setup only (stack already deployed)
+### 4. (Optional) Lock the KMS key permanently
 
 ```sh
-./scripts/setup_keys.sh
+./scripts/lock_kms_policy.sh
 ```
 
-## Local Development
+**Warning:** This is irreversible. After locking, no one can modify the key policy or decrypt outside the enclave with the matching PCR0.
 
-For local testing without a Nitro Enclave, set the secret key directly:
+## Reproducible Build
 
-```sh
-export INTROSPECTOR_SECRET_KEY=<64-char-hex-private-key>
-export INTROSPECTOR_NO_TLS=true
-go run .
-```
+The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/aws-nitro-util](https://github.com/monzo/aws-nitro-util), producing a byte-identical EIF on every build. This guarantees identical PCR0 measurements across builds, enabling anyone to verify that the running enclave matches the published source code.
 
-The server listens on port 7073 by default. Override with `INTROSPECTOR_PORT`.
+### Nix packages
 
-## Test Client
+| Package                | Description                                    |
+|------------------------|------------------------------------------------|
+| `introspector-init`    | KMS decrypt + pubkey registration + exec       |
+| `introspector-upstream`| Upstream signing service (pinned commit)       |
+| `nitriding`            | TLS termination + attestation daemon           |
+| `viproxy`              | IMDS forwarding for enclave                    |
+| `eif`                  | Complete enclave image (default)               |
+| `enclave-image`        | Docker image (legacy, for comparison)          |
 
-The included client verifies the enclave's attestation document before submitting a transaction:
-
-```sh
-go run ./cmd/introspector-client \
-  -base-url https://<enclave-host> \
-  -expected-pcr0 <hex> \
-  -ark-tx <payload> \
-  -checkpoint-tx <payload>
-```
-
-Use `-insecure` to skip TLS verification during development.
-
-## Reproducible Build Verification
-
-The enclave image is built with [Nix](https://nixos.org/) using `dockerTools.buildImage`, which produces a byte-identical Docker image on every build. This eliminates non-determinism from Docker layer ordering and guarantees identical PCR0 measurements.
-
-### Build the enclave image
+Build individual packages:
 
 ```sh
-VERSION=dev AWS_REGION=us-east-1 nix build --impure .#enclave-image
-```
-
-This produces a Docker image tarball at `./result`. Load it with:
-
-```sh
-docker load < result
+nix build .#introspector-init
+nix build .#introspector-upstream
+nix build .#eif
 ```
 
 ### Verify a running enclave
 
-The client builds the Docker image locally with Nix, then runs `nitro-cli build-enclave` **remotely on the EC2 instance** via SSM to derive the PCR0. This ensures the EIF is built with Amazon's official `nitro-cli` package (whose bundled kernel/init blobs determine the PCR0), matching what the deployment uses.
+The client builds the Docker image locally with Nix, then runs `nitro-cli build-enclave` remotely on the EC2 instance via SSM to derive the PCR0:
 
 ```sh
 go run ./cmd/introspector-client \
@@ -172,27 +201,26 @@ go run ./cmd/introspector-client \
   --insecure
 ```
 
-This will:
-1. Run `nix build .#enclave-image` locally to produce a deterministic Docker image tarball
-2. Upload the tarball to S3 so the EC2 instance can fetch it
-3. Run an SSM command on the instance to download the image, load it into Docker, and run `nitro-cli build-enclave` to derive PCR0
-4. Fetch the attestation document from the running enclave
-5. Verify the attestation signature, nonce, and PCR0 match
-6. Clean up the S3 object
+## Test Client
 
-The `--build-version` flag must match the `VERSION` used by the operator (the CDK deployment uses the `CDK_PREFIX` value, which defaults to `dev`).
-
-### Using the deploy script
+The included client verifies the enclave's attestation document and pubkey binding before submitting a transaction:
 
 ```sh
-VERIFY_BUILD=1 BUILD_VERSION=dev INSECURE_TLS=1 ./scripts/deploy_and_call.sh
+go run ./cmd/introspector-client \
+  -base-url https://<enclave-host> \
+  -expected-pcr0 <hex> \
+  -ark-tx <payload> \
+  -checkpoint-tx <payload>
 ```
 
-The script auto-detects the S3 bucket from the CDK assets bucket (`cdk-hnb659fds-assets-<account>-<region>`). Override with `S3_BUCKET` if needed.
+The client:
 
-### Prerequisites for build verification
+1. Fetches the attestation document with a random nonce
+2. Verifies the attestation signature and PCR0
+3. Fetches `/v1/info` and verifies `SHA256(pubkey)` matches the attestation `UserData` app hash
+4. Submits the transaction
 
-`--verify-build` requires `nix` and `aws` CLI in PATH locally. The `nitro-cli` is **not** needed locally -- it runs on the EC2 instance via SSM. The instance must have SSM agent running and the `aws-nitro-enclaves-cli` package installed (both are configured by the CDK stack's user data).
+Use `-insecure` to skip TLS verification during development. Use `-verify-pubkey=false` to skip step 3.
 
 ## Configuration
 
@@ -202,12 +230,14 @@ All configuration is via environment variables prefixed with `INTROSPECTOR_`:
 |--------------------------------------------|----------------------------------------|------------|
 | `INTROSPECTOR_SECRET_KEY`                  | Signing key (hex). Set by KMS at boot. | (required) |
 | `INTROSPECTOR_PORT`                        | HTTP listen port                       | `7073`     |
-| `INTROSPECTOR_NO_TLS`                      | Disable TLS (required for skeleton)    | `false`    |
+| `INTROSPECTOR_NO_TLS`                      | Disable TLS (nitriding handles TLS)    | `true`     |
 | `INTROSPECTOR_LOG_LEVEL`                   | Log verbosity level                    | `debug`    |
 | `INTROSPECTOR_SECRET_KEY_CIPHERTEXT`       | Base64 KMS ciphertext (direct)         | (from SSM) |
 | `INTROSPECTOR_SECRET_KEY_CIPHERTEXT_PARAM` | SSM parameter name for ciphertext      | `/<deployment>/NitroIntrospector/SecretKeyCiphertext` |
 | `INTROSPECTOR_DEPLOYMENT`                  | Deployment name for SSM paths          | `dev`      |
 | `INTROSPECTOR_KMS_KEY_ID`                  | KMS key ID override                    | (auto)     |
+| `INTROSPECTOR_NITRIDING_INT_PORT`          | Nitriding internal port                | `8080`     |
+| `INTROSPECTOR_AWS_REGION`                  | AWS region for KMS/SSM                 | `us-east-1`|
 
 ## Watchdog
 

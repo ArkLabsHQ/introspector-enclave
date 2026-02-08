@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -22,6 +23,11 @@ import (
 
 type attestationResponse struct {
 	Document string `json:"document"`
+}
+
+type getInfoResponse struct {
+	SignerPubkey string `json:"signer_pubkey"`
+	Version      string `json:"version"`
 }
 
 type submitTxRequest struct {
@@ -46,6 +52,7 @@ func main() {
 	repoPath := flag.String("repo-path", ".", "Path to source repository (used with --verify-build)")
 	buildVersion := flag.String("build-version", "", "VERSION for nix build (used with --verify-build)")
 	buildRegion := flag.String("build-region", "", "AWS_REGION for nix build (used with --verify-build)")
+	verifyPubkey := flag.Bool("verify-pubkey", true, "Verify that /v1/info pubkey matches attestation UserData hash")
 	flag.Parse()
 
 	if *baseURL == "" {
@@ -71,9 +78,17 @@ func main() {
 
 	client := httpClient(*insecure)
 
-	if err := verifyAttestation(client, *baseURL, pcr0); err != nil {
+	attestResult, err := verifyAttestation(client, *baseURL, pcr0)
+	if err != nil {
 		fmt.Fprintf(os.Stderr, "pre-request attestation failed: %v\n", err)
 		os.Exit(1)
+	}
+
+	if *verifyPubkey {
+		if err := verifyPubkeyBinding(client, *baseURL, attestResult); err != nil {
+			fmt.Fprintf(os.Stderr, "pubkey binding verification failed: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if err := submitTx(client, *baseURL, *arkTx, *checkpointTx); err != nil {
@@ -147,33 +162,33 @@ func httpClient(insecure bool) *http.Client {
 	}
 }
 
-func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) error {
+func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) (*nitrite.Result, error) {
 	nonce := make([]byte, 20)
 	if _, err := rand.Read(nonce); err != nil {
-		return fmt.Errorf("generate nonce: %w", err)
+		return nil, fmt.Errorf("generate nonce: %w", err)
 	}
 	nonceHex := hex.EncodeToString(nonce)
 
 	url := strings.TrimRight(baseURL, "/") + "/enclave/attestation?nonce=" + nonceHex
 	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("attestation status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		return nil, fmt.Errorf("attestation status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
 	payload, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
 	docB64 := strings.TrimSpace(string(payload))
@@ -186,7 +201,7 @@ func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) error 
 
 	docBytes, err := base64.StdEncoding.DecodeString(docB64)
 	if err != nil {
-		return fmt.Errorf("decode attestation document: %w", err)
+		return nil, fmt.Errorf("decode attestation document: %w", err)
 	}
 
 	result, err := nitrite.Verify(docBytes, nitrite.VerifyOptions{
@@ -196,36 +211,112 @@ func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) error 
 		if result != nil && result.SignatureOK {
 			fmt.Fprintf(os.Stderr, "warning: attestation signature OK but validation error: %v\n", err)
 		} else {
-			return err
+			return nil, err
 		}
 	}
 
 	if result == nil || result.Document == nil {
-		return fmt.Errorf("attestation missing document")
+		return nil, fmt.Errorf("attestation missing document")
 	}
 
 	expectedNonce, err := hex.DecodeString(nonceHex)
 	if err != nil {
-		return fmt.Errorf("decode nonce: %w", err)
+		return nil, fmt.Errorf("decode nonce: %w", err)
 	}
 	if len(result.Document.Nonce) == 0 {
-		return fmt.Errorf("attestation missing nonce")
+		return nil, fmt.Errorf("attestation missing nonce")
 	}
 	if !bytes.Equal(result.Document.Nonce, expectedNonce) {
-		return fmt.Errorf("attestation nonce mismatch")
+		return nil, fmt.Errorf("attestation nonce mismatch")
 	}
 
 	if expectedPCR0 != "" {
 		pcr0, ok := result.Document.PCRs[0]
 		if !ok {
-			return fmt.Errorf("attestation missing PCR0")
+			return nil, fmt.Errorf("attestation missing PCR0")
 		}
 		if !strings.EqualFold(hex.EncodeToString(pcr0), expectedPCR0) {
-			return fmt.Errorf("PCR0 mismatch")
+			return nil, fmt.Errorf("PCR0 mismatch")
 		}
 	}
 
 	fmt.Println("attestation verified")
+	return result, nil
+}
+
+// verifyPubkeyBinding fetches the signer pubkey from /v1/info and verifies
+// that its SHA256 hash matches the appKeyHash embedded in the attestation
+// document's UserData field (set by nitriding from POST /enclave/hash).
+//
+// Nitriding's UserData format (AttestationHashes.Serialize()):
+//
+//	[0x12, 0x20, <tlsKeyHash:32 bytes>, 0x12, 0x20, <appKeyHash:32 bytes>]
+//
+// Total: 68 bytes.  The appKeyHash starts at offset 34.
+func verifyPubkeyBinding(client *http.Client, baseURL string, attestResult *nitrite.Result) error {
+	if attestResult == nil || attestResult.Document == nil {
+		return fmt.Errorf("no attestation result to verify against")
+	}
+
+	userData := attestResult.Document.UserData
+	// Nitriding serializes two multihash-prefixed SHA256 hashes: 2*(2+32) = 68 bytes
+	if len(userData) < 68 {
+		return fmt.Errorf("attestation UserData too short (%d bytes, expected >= 68); nitriding may not have received the app key hash", len(userData))
+	}
+
+	// Extract appKeyHash: skip multihash prefix (2 bytes) + tlsKeyHash (32 bytes) + multihash prefix (2 bytes)
+	appKeyHash := userData[36:68]
+
+	// Check that appKeyHash is not all zeros (meaning the app never registered a pubkey)
+	allZero := true
+	for _, b := range appKeyHash {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return fmt.Errorf("attestation appKeyHash is all zeros; enclave did not register its signing pubkey")
+	}
+
+	// Fetch the signer pubkey from /v1/info
+	url := strings.TrimRight(baseURL, "/") + "/v1/info"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		return fmt.Errorf("create info request: %w", err)
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("fetch /v1/info: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("/v1/info status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var info getInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return fmt.Errorf("decode /v1/info: %w", err)
+	}
+
+	pubkeyBytes, err := hex.DecodeString(info.SignerPubkey)
+	if err != nil {
+		return fmt.Errorf("decode signer pubkey hex: %w", err)
+	}
+
+	// Compute SHA256 of the compressed public key and compare
+	computedHash := sha256.Sum256(pubkeyBytes)
+	if !bytes.Equal(computedHash[:], appKeyHash) {
+		return fmt.Errorf("pubkey binding mismatch: SHA256(%s) = %s, but attestation appKeyHash = %s",
+			info.SignerPubkey,
+			hex.EncodeToString(computedHash[:]),
+			hex.EncodeToString(appKeyHash))
+	}
+
+	fmt.Printf("pubkey binding verified: %s attested in enclave\n", info.SignerPubkey)
 	return nil
 }
 

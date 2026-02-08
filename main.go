@@ -1,12 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"time"
+	"os"
+	"syscall"
 
 	"github.com/ArkLabsHQ/introspector/internal/config"
 	log "github.com/sirupsen/logrus"
@@ -14,168 +17,80 @@ import (
 
 var Version = "dev"
 
-type getInfoResponse struct {
-	SignerPubkey string `json:"signer_pubkey"`
-	Version      string `json:"version"`
-}
-
-type submitTxRequest struct {
-	ArkTx         string   `json:"ark_tx"`
-	CheckpointTxs []string `json:"checkpoint_txs"`
-}
-
-type submitTxResponse struct {
-	SignedArkTx         string   `json:"signed_ark_tx"`
-	SignedCheckpointTxs []string `json:"signed_checkpoint_txs"`
-}
-
-type intentPayload struct {
-	Proof   string `json:"proof"`
-	Message string `json:"message"`
-}
-
-type submitIntentRequest struct {
-	Intent intentPayload `json:"intent"`
-}
-
-type submitIntentResponse struct {
-	SignedProof string `json:"signed_proof"`
-}
-
-type txTreeNode struct {
-	Txid     string            `json:"txid"`
-	Tx       string            `json:"tx"`
-	Children map[uint32]string `json:"children"`
-}
-
-type submitFinalizationRequest struct {
-	SignedIntent intentPayload `json:"signed_intent"`
-	Forfeits     []string      `json:"forfeits"`
-	Connector    []txTreeNode  `json:"connector_tree"`
-	VtxoTree     []txTreeNode  `json:"vtxo_tree"`
-	CommitmentTx string        `json:"commitment_tx"`
-}
-
-type submitFinalizationResponse struct {
-	SignedForfeits     []string `json:"signed_forfeits"`
-	SignedCommitmentTx string   `json:"signed_commitment_tx"`
-}
-
-type errorResponse struct {
-	Error string `json:"error"`
-}
+const introspectorBin = "/app/introspector"
 
 func main() {
+	log.Infof("introspector-init %s starting", Version)
+
+	// 1. Decrypt the signing key from KMS (with attestation).
 	if err := waitForSecretKeyFromKMS(context.Background()); err != nil {
 		log.Fatalf("failed to load secret key from KMS: %s", err)
 	}
+
+	// 2. Validate the key and derive the public key.
 	cfg, err := config.LoadConfig()
 	if err != nil {
 		log.Fatalf("invalid config: %s", err)
 	}
-	if !cfg.NoTLS {
-		log.Fatal("TLS is not supported in the skeleton server; set INTROSPECTOR_NO_TLS=true")
+
+	pubkeyBytes := cfg.SecretKey.PubKey().SerializeCompressed()
+
+	// 3. Register the signing pubkey hash with nitriding so it is included in
+	// attestation documents (UserData field). Clients can then verify that
+	// the attested enclave holds this exact key.
+	if err := registerPubkeyWithNitriding(pubkeyBytes); err != nil {
+		log.Warnf("failed to register pubkey with nitriding (may not be running): %s", err)
 	}
+	signalNitridingReady()
 
-	pubkeyHex := hex.EncodeToString(cfg.SecretKey.PubKey().SerializeCompressed())
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/v1/info", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		writeJSON(w, http.StatusOK, getInfoResponse{
-			SignerPubkey: pubkeyHex,
-			Version:      Version,
-		})
-	})
-
-	mux.HandleFunc("/v1/tx", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		var req submitTxRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if req.ArkTx == "" || len(req.CheckpointTxs) == 0 {
-			writeError(w, http.StatusBadRequest, "ark_tx and checkpoint_txs are required")
-			return
-		}
-
-		writeJSON(w, http.StatusOK, submitTxResponse{
-			SignedArkTx:         req.ArkTx,
-			SignedCheckpointTxs: req.CheckpointTxs,
-		})
-	})
-
-	mux.HandleFunc("/v1/intent", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		var req submitIntentRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if req.Intent.Proof == "" {
-			writeError(w, http.StatusBadRequest, "intent.proof is required")
-			return
-		}
-		writeJSON(w, http.StatusOK, submitIntentResponse{
-			SignedProof: req.Intent.Proof,
-		})
-	})
-
-	mux.HandleFunc("/v1/finalization", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-			return
-		}
-		var req submitFinalizationRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeError(w, http.StatusBadRequest, err.Error())
-			return
-		}
-		if req.CommitmentTx == "" {
-			writeError(w, http.StatusBadRequest, "commitment_tx is required")
-			return
-		}
-		writeJSON(w, http.StatusOK, submitFinalizationResponse{
-			SignedForfeits:     req.Forfeits,
-			SignedCommitmentTx: req.CommitmentTx,
-		})
-	})
-
-	server := &http.Server{
-		Addr:              fmt.Sprintf(":%d", cfg.Port),
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-	}
-
-	log.Infof("introspector skeleton listening on %s", server.Addr)
-	log.Fatal(server.ListenAndServe())
+	// 4. Exec the real introspector binary, replacing this process.
+	// The upstream binary reads INTROSPECTOR_SECRET_KEY from the environment
+	// (already set by waitForSecretKeyFromKMS) and serves the full signing API.
+	log.Infof("exec %s", introspectorBin)
+	err = syscall.Exec(introspectorBin, []string{"introspector"}, os.Environ())
+	// syscall.Exec only returns on error.
+	log.Fatalf("exec %s: %s", introspectorBin, err)
 }
 
-func decodeJSON(r *http.Request, out any) error {
-	dec := json.NewDecoder(r.Body)
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(out); err != nil {
-		return fmt.Errorf("invalid JSON body: %w", err)
+// nitridingIntPort returns the nitriding internal port (default 8080).
+func nitridingIntPort() string {
+	if p := os.Getenv("INTROSPECTOR_NITRIDING_INT_PORT"); p != "" {
+		return p
 	}
+	return "8080"
+}
+
+// registerPubkeyWithNitriding POSTs SHA256(compressedPubkey) to nitriding's
+// /enclave/hash endpoint.  Nitriding includes this hash in the UserData field
+// of all subsequent attestation documents, binding the enclave identity to the
+// signing key.
+func registerPubkeyWithNitriding(compressedPubkey []byte) error {
+	hash := sha256.Sum256(compressedPubkey)
+	body := base64.StdEncoding.EncodeToString(hash[:])
+
+	url := fmt.Sprintf("http://127.0.0.1:%s/enclave/hash", nitridingIntPort())
+	resp, err := http.Post(url, "application/octet-stream", bytes.NewBufferString(body))
+	if err != nil {
+		return fmt.Errorf("POST /enclave/hash: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("POST /enclave/hash returned %d", resp.StatusCode)
+	}
+
+	log.Infof("registered pubkey hash with nitriding (sha256: %s)", hex.EncodeToString(hash[:]))
 	return nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(payload)
-}
-
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, errorResponse{Error: message})
+// signalNitridingReady tells nitriding the application is ready to serve.
+func signalNitridingReady() {
+	url := fmt.Sprintf("http://127.0.0.1:%s/enclave/ready", nitridingIntPort())
+	resp, err := http.Get(url)
+	if err != nil {
+		log.Warnf("failed to signal readiness to nitriding: %s", err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Info("signaled readiness to nitriding")
 }
