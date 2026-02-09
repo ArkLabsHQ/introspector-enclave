@@ -16,7 +16,7 @@
 #
 # Requires:
 #   - CDK_DEPLOY_REGION and CDK_DEPLOY_ACCOUNT environment variables
-#   - result/pcr.json from a Nix build (for PCR0)
+#   - artifacts/pcr.json from a Nix build (for PCR0)
 #   - cdk-outputs.json (or argument) with KMSKeyID and EC2InstanceRoleARN
 
 set -euo pipefail
@@ -40,10 +40,10 @@ get_output() {
 }
 
 # Read PCR0 from build output
-pcr0=$(jq -r '.PCR0' result/pcr.json 2>/dev/null || true)
+pcr0=$(jq -r '.PCR0' artifacts/pcr.json 2>/dev/null || true)
 if [[ -z "${pcr0}" || "${pcr0}" == "null" ]]; then
-  echo "Failed to read PCR0 from result/pcr.json" >&2
-  echo "Run 'nix build --impure .#eif' first." >&2
+  echo "Failed to read PCR0 from artifacts/pcr.json" >&2
+  echo "Run './scripts/build_eif.sh' first." >&2
   exit 1
 fi
 

@@ -15,7 +15,7 @@ EC2 Instance (m6i.xlarge, Amazon Linux 2023)     |
   v                                       192.168.127.1
 Nitro Enclave ---------------------------------->+
   ├── nitriding             (TLS termination + attestation)
-  ├── introspector-init     (KMS decrypt + pubkey attestation + exec)
+  ├── introspector-init     (KMS decrypt + PCR16 pubkey binding + exec)
   ├── introspector          (upstream signing service, port 7073)
   └── viproxy               (IMDS forwarding -> vsock CID 3:8002)
 ```
@@ -25,8 +25,7 @@ Nitro Enclave ---------------------------------->+
 1. **nitriding** starts and sets up the TAP network interface via gvproxy
 2. **introspector-init** runs as the app command:
    - Decrypts the signing key from KMS using a Nitro attestation document (PCR0-bound)
-   - Derives the public key and registers `SHA256(compressedPubkey)` with nitriding via `POST /enclave/hash`
-   - Signals readiness to nitriding via `GET /enclave/ready`
+   - Derives the compressed public key and extends PCR16 with `SHA256(compressedPubkey)`, then locks it
    - `syscall.Exec`s the real **introspector** binary, replacing itself
 3. **introspector** (upstream) starts serving the full gRPC + HTTP signing API on port 7073, reading `INTROSPECTOR_SECRET_KEY` from the environment
 
@@ -67,38 +66,41 @@ For maximum security, `scripts/lock_kms_policy.sh` applies an **irreversible** p
 ./scripts/lock_kms_policy.sh
 ```
 
-### Pubkey Attestation
+### Pubkey Attestation via PCR16
 
-The signing public key is cryptographically bound to the enclave's attestation:
+The signing public key is cryptographically bound to the enclave's attestation document via PCR16:
 
-1. `introspector-init` computes `SHA256(compressedPubkey)` and sends it to nitriding's `/enclave/hash` endpoint
-2. Nitriding includes this hash in the `UserData` field of all subsequent attestation documents
-3. Clients fetch the attestation document and `/v1/info` pubkey, then verify the hash matches
+1. `introspector-init` computes `SHA256(compressedPubkey)`, extends PCR16 with that hash, and locks PCR16
+2. The resulting PCR16 value is `SHA384(zeros_48 || SHA256(pubkey))` (standard PCR extension starting from 48 zero bytes)
+3. Clients fetch the attestation document and `/v1/info` pubkey, then verify that `SHA384(zeros_48 || SHA256(pubkey))` matches `PCRs[16]`
 
-This ensures the pubkey returned by the API genuinely belongs to the attested enclave.
+This ensures the pubkey returned by the API genuinely belongs to the attested enclave, using a first-class PCR value rather than application-level UserData.
 
 ## Project Structure
 
 ```
 .
-├── main.go                        # introspector-init: KMS decrypt + pubkey registration + exec
-├── kms_ssm.go                     # KMS encrypt/decrypt with attestation, SSM storage
-├── imds.go                        # IMDS credential fetching via viproxy
-├── internal/config/               # Configuration (env vars via viper)
-├── cmd/
-│   ├── watchdog/                  # Enclave lifecycle supervisor
-│   └── introspector-client/       # Client with attestation + pubkey verification
-├── flake.nix                      # Nix flake: reproducible EIF build
 ├── enclave/
+│   ├── main.go                    # introspector-init: KMS decrypt + PCR16 pubkey binding + exec
+│   ├── kms_ssm.go                 # KMS encrypt/decrypt with attestation, SSM storage
+│   ├── config.go                  # Configuration (env vars via viper)
+│   ├── imds.go                    # IMDS credential fetching via viproxy
 │   ├── start.sh                   # Entrypoint (viproxy + nitriding + introspector-init)
+│   ├── enclave_init.sh            # Host-side script to start the enclave via nitro-cli
 │   ├── gvproxy/                   # Network proxy for vsock forwarding
-│   └── systemd/                   # Service units for EC2 host
+│   ├── systemd/                   # Service units for EC2 host
+│   └── user_data/                 # EC2 cloud-init user data
+├── builder/
+│   ├── flake.nix                  # Nix flake: reproducible EIF build
+│   └── main.go                    # AWS CDK infrastructure (VPC, EC2, KMS, IAM)
+├── client/
+│   └── main.go                    # Attestation verification client (PCR0 + PCR16)
 ├── scripts/
-│   ├── deploy_introspector.sh     # Full deployment (CDK + key setup + KMS policy)
-│   ├── lock_kms_policy.sh         # Irreversible KMS lockdown (PCR0-only decrypt)
-│   └── setup_keys.sh              # Key setup only (stack already deployed)
-├── cdk/                           # AWS CDK infrastructure (VPC, EC2, KMS, IAM)
-└── user_data/                     # EC2 cloud-init user data
+│   ├── build_eif.sh               # Build EIF reproducibly via Docker + Nix
+│   ├── deploy.sh                  # CDK deploy + KMS policy setup
+│   ├── call.sh                    # Verify attestation + pubkey binding
+│   └── lock_kms_policy.sh         # Irreversible KMS lockdown (PCR0-only decrypt)
+└── cdk.json                       # CDK app entry point
 ```
 
 ## API Endpoints
@@ -117,9 +119,10 @@ Request and response schemas are defined in `api-spec/protobuf/introspector/v1/s
 
 ## Prerequisites
 
-- [Nix](https://nixos.org/download/) with flakes enabled
+- Docker (for reproducible EIF builds via pinned NixOS container)
 - AWS CLI v2 configured with appropriate credentials
 - AWS CDK CLI (`npm install -g aws-cdk`)
+- Go 1.25+
 - An AWS account with permissions for EC2, KMS, SSM, ECR, VPC, and IAM
 - `jq`
 
@@ -136,25 +139,33 @@ export CDK_PREFIX=dev  # optional, defaults to "dev"
 ### 2. Build the enclave image
 
 ```sh
-VERSION=dev AWS_REGION=us-east-1 nix build --impure .#eif
+./scripts/build_eif.sh
 ```
 
-This produces `result/image.eif` and `result/pcr.json` with the PCR0 measurement.
+This builds the EIF reproducibly inside a pinned NixOS Docker container (`nixos/nix:2.24.9`) and outputs `artifacts/image.eif` and `artifacts/pcr.json` with the PCR measurements.
 
-### 3. Deploy infrastructure + set up keys
+### 3. Deploy infrastructure + apply KMS policy
 
 ```sh
-./scripts/deploy_introspector.sh
+./scripts/deploy.sh
 ```
 
 This script:
 
+- Reads PCR0 from `artifacts/pcr.json` (build step must be run first)
 - Deploys the CDK stack (VPC, EC2, KMS key, ECR images, systemd services)
-- Waits for the EC2 instance and enclave to come up
-- The enclave generates a signing key on first boot
 - Applies a KMS key policy restricting decryption to the enclave's PCR0
+- Waits for the EC2 instance to be ready
 
-### 4. (Optional) Lock the KMS key permanently
+### 4. Verify the enclave
+
+```sh
+INSECURE_TLS=1 ./scripts/call.sh
+```
+
+This verifies the enclave's attestation document and pubkey binding via PCR16. Use `INSECURE_TLS=1` because the enclave's self-signed TLS cert won't have IP SANs (trust comes from attestation, not TLS).
+
+### 5. (Optional) Lock the KMS key permanently
 
 ```sh
 ./scripts/lock_kms_policy.sh
@@ -164,63 +175,50 @@ This script:
 
 ## Reproducible Build
 
-The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/aws-nitro-util](https://github.com/monzo/aws-nitro-util), producing a byte-identical EIF on every build. This guarantees identical PCR0 measurements across builds, enabling anyone to verify that the running enclave matches the published source code.
+The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/aws-nitro-util](https://github.com/monzo/aws-nitro-util) inside a pinned Docker container, producing a byte-identical EIF on every build. This guarantees identical PCR0 measurements across builds, enabling anyone to verify that the running enclave matches the published source code.
 
 ### Nix packages
 
 | Package                | Description                                    |
 |------------------------|------------------------------------------------|
-| `introspector-init`    | KMS decrypt + pubkey registration + exec       |
+| `introspector-init`    | KMS decrypt + PCR16 pubkey binding + exec      |
 | `introspector-upstream`| Upstream signing service (pinned commit)       |
 | `nitriding`            | TLS termination + attestation daemon           |
 | `viproxy`              | IMDS forwarding for enclave                    |
 | `eif`                  | Complete enclave image (default)               |
-| `enclave-image`        | Docker image (legacy, for comparison)          |
-
-Build individual packages:
-
-```sh
-nix build .#introspector-init
-nix build .#introspector-upstream
-nix build .#eif
-```
 
 ### Verify a running enclave
 
-The client builds the Docker image locally with Nix, then runs `nitro-cli build-enclave` remotely on the EC2 instance via SSM to derive the PCR0:
+The client can build the EIF locally via Docker and compare PCR0 against the running enclave's attestation:
 
 ```sh
-go run ./cmd/introspector-client \
-  --base-url https://<enclave-host> \
+cd client && go run . \
+  --base-url https://<enclave-ip> \
   --verify-build \
-  --instance-id <ec2-instance-id> \
-  --s3-bucket <bucket-for-image-upload> \
   --repo-path /path/to/introspector-enclave \
   --build-version dev \
   --build-region us-east-1 \
   --insecure
 ```
 
-## Test Client
+## Client
 
-The included client verifies the enclave's attestation document and pubkey binding before submitting a transaction:
+The included client (`client/`) verifies the enclave's attestation document and pubkey binding:
 
 ```sh
-go run ./cmd/introspector-client \
-  -base-url https://<enclave-host> \
-  -expected-pcr0 <hex> \
-  -ark-tx <payload> \
-  -checkpoint-tx <payload>
+cd client && go run . \
+  --base-url https://<enclave-ip> \
+  --expected-pcr0 <hex> \
+  --insecure
 ```
 
 The client:
 
 1. Fetches the attestation document with a random nonce
 2. Verifies the attestation signature and PCR0
-3. Fetches `/v1/info` and verifies `SHA256(pubkey)` matches the attestation `UserData` app hash
-4. Submits the transaction
+3. Fetches `/v1/info` and verifies `SHA384(zeros_48 || SHA256(pubkey))` matches attestation `PCRs[16]`
 
-Use `-insecure` to skip TLS verification during development. Use `-verify-pubkey=false` to skip step 3.
+Use `--insecure` to skip TLS verification (trust comes from attestation). Use `--verify-pubkey=false` to skip step 3.
 
 ## Configuration
 
@@ -241,14 +239,14 @@ All configuration is via environment variables prefixed with `INTROSPECTOR_`:
 
 ## Watchdog
 
-The watchdog (`cmd/watchdog`) runs on the EC2 host as a systemd service. It starts the Nitro Enclave via `nitro-cli` and polls its status, restarting the enclave if it exits.
+The enclave watchdog runs on the EC2 host as a systemd service (`enclave-watchdog.service`). It starts the Nitro Enclave via `nitro-cli` and restarts it if it exits.
 
-| Variable                | Description                 | Default                                        |
-|-------------------------|-----------------------------|-------------------------------------------------|
-| `ENCLAVE_NAME`          | Enclave name                | `app`                                           |
-| `EIF_PATH`              | Path to enclave image file  | `/home/ec2-user/app/server/signing_server.eif`  |
-| `CPU_COUNT`             | vCPUs allocated to enclave  | `2`                                             |
-| `MEMORY_MIB`            | Memory allocated (MiB)      | `4320`                                          |
-| `ENCLAVE_CID`           | vsock CID                   | `16`                                            |
-| `DEBUG_MODE`            | Enable debug console        | `false`                                         |
-| `POLL_INTERVAL_SECONDS` | Health check interval (s)   | `5`                                             |
+| Variable                | Description                 | Default                                |
+|-------------------------|-----------------------------|----------------------------------------|
+| `ENCLAVE_NAME`          | Enclave name                | `app`                                  |
+| `EIF_PATH`              | Path to enclave image file  | `/home/ec2-user/app/image.eif`         |
+| `CPU_COUNT`             | vCPUs allocated to enclave  | `2`                                    |
+| `MEMORY_MIB`            | Memory allocated (MiB)      | `4320`                                 |
+| `ENCLAVE_CID`           | vsock CID                   | `16`                                   |
+| `DEBUG_MODE`            | Enable debug console        | `false`                                |
+| `POLL_INTERVAL_SECONDS` | Health check interval (s)   | `5`                                    |

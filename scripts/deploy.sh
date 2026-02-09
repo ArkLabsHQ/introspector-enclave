@@ -87,14 +87,14 @@ EOF
     --policy "${policy}"
 }
 
-# Step 1: Build EIF and get PCR0 from build output
-echo "[deploy] Building EIF with Nix (reproducible build)..."
-VERSION="${prefix}" AWS_REGION="${region}" nix build --impure .#eif
-
-# Get PCR0 from Nix build output (deterministic, known before deployment)
-pcr0=$(jq -r '.PCR0' result/pcr.json)
+# Step 1: Read PCR0 from pre-built artifacts (run ./scripts/build_eif.sh first)
+if [[ ! -f artifacts/pcr.json ]]; then
+  echo "artifacts/pcr.json not found. Run ./scripts/build_eif.sh first." >&2
+  exit 1
+fi
+pcr0=$(jq -r '.PCR0' artifacts/pcr.json)
 if [[ -z "${pcr0}" || "${pcr0}" == "null" ]]; then
-  echo "Failed to get PCR0 from result/pcr.json" >&2
+  echo "Failed to get PCR0 from artifacts/pcr.json" >&2
   exit 1
 fi
 echo "[deploy] PCR0 from build: ${pcr0}"

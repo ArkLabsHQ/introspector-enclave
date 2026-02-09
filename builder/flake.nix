@@ -20,24 +20,22 @@
 
         # Filter source to only include files relevant to the Go build.
         src = pkgs.lib.cleanSourceWith {
-          src = ./.;
+          src = ../enclave;
           filter = path: type:
             let
-              relPath = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
               isGoFile = pkgs.lib.hasSuffix ".go" path;
               isGoMod = builtins.baseNameOf path == "go.mod" || builtins.baseNameOf path == "go.sum";
-              isInternal = pkgs.lib.hasPrefix "internal/" relPath;
             in
-              type == "directory" || isGoFile || isGoMod || isInternal;
+              type == "directory" || isGoFile || isGoMod;
         };
 
-        # Init binary: decrypts key via KMS, registers pubkey with nitriding,
+        # Init binary: decrypts key via KMS, extends PCR16 with pubkey hash,
         # then exec's the real introspector binary.
         introspector-init = pkgs.buildGoModule {
           pname = "introspector-init";
           inherit version src;
 
-          vendorHash = "sha256-0MjCpjOOt1T/vNpUXEHSDj+gjzNOXZTZzUti36JF3cA=";
+          vendorHash = "sha256-50QaMGcKse0dm6BtG/3q1V9GUQmm4GqRARXewvNSfiw=";
 
           subPackages = [ "." ];
           env.CGO_ENABLED = "0";
@@ -48,7 +46,7 @@
           tags = [ "netgo" ];
 
           postInstall = ''
-            mv $out/bin/introspector $out/bin/introspector-init
+            mv $out/bin/introspector-enclave $out/bin/introspector-init
           '';
         };
 
@@ -130,7 +128,7 @@
           cp ${introspector-upstream}/bin/introspector $out/app/introspector
           cp ${nitriding}/bin/nitriding $out/app/nitriding
           cp ${viproxy}/bin/proxy $out/app/proxy
-          install -m 0755 ${./enclave/start.sh} $out/app/start.sh
+          install -m 0755 ${../enclave/start.sh} $out/app/start.sh
         '';
 
         # Complete rootfs for the enclave.

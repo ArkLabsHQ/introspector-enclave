@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/sha512"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
@@ -15,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -26,7 +28,7 @@ type attestationResponse struct {
 }
 
 type getInfoResponse struct {
-	SignerPubkey string `json:"signer_pubkey"`
+	SignerPubkey string `json:"signerPubkey"`
 	Version      string `json:"version"`
 }
 
@@ -44,15 +46,13 @@ type nitroBuildOutput struct {
 
 func main() {
 	baseURL := flag.String("base-url", "", "Base URL for the enclave (e.g., https://host)")
-	arkTx := flag.String("ark-tx", "", "Ark transaction payload")
-	checkpointTx := flag.String("checkpoint-tx", "", "Checkpoint transaction payload")
 	insecure := flag.Bool("insecure", false, "Skip TLS verification")
 	expectedPCR0 := flag.String("expected-pcr0", "", "Expected PCR0 hex (optional)")
 	verifyBuild := flag.Bool("verify-build", false, "Build enclave EIF locally with Nix and derive expected PCR0")
 	repoPath := flag.String("repo-path", ".", "Path to source repository (used with --verify-build)")
 	buildVersion := flag.String("build-version", "", "VERSION for nix build (used with --verify-build)")
 	buildRegion := flag.String("build-region", "", "AWS_REGION for nix build (used with --verify-build)")
-	verifyPubkey := flag.Bool("verify-pubkey", true, "Verify that /v1/info pubkey matches attestation UserData hash")
+	verifyPubkey := flag.Bool("verify-pubkey", true, "Verify that /v1/info pubkey matches attestation PCR16 hash")
 	flag.Parse()
 
 	if *baseURL == "" {
@@ -91,39 +91,54 @@ func main() {
 		}
 	}
 
-	if err := submitTx(client, *baseURL, *arkTx, *checkpointTx); err != nil {
-		fmt.Fprintf(os.Stderr, "submit tx failed: %v\n", err)
-		os.Exit(1)
-	}
+	// if err := submitTx(client, *baseURL, *arkTx, *checkpointTx); err != nil {
+	// 	fmt.Fprintf(os.Stderr, "submit tx failed: %v\n", err)
+	// 	os.Exit(1)
+	// }
 }
 
 func buildAndExtractPCR0(repoPath, version, region string) (string, error) {
-	if _, err := exec.LookPath("nix"); err != nil {
-		return "", fmt.Errorf("nix not found in PATH: %w", err)
+	if _, err := exec.LookPath("docker"); err != nil {
+		return "", fmt.Errorf("docker not found in PATH: %w", err)
 	}
 
-	// Remove existing result symlink to ensure we don't read stale pcr.json.
-	resultPath := repoPath + "/result"
-	_ = os.Remove(resultPath)
-
-	// Build the EIF locally with Nix (uses monzo/aws-nitro-util for reproducible builds).
-	// Use --rebuild to force a fresh build and avoid cached results.
-	fmt.Println("[verify] building EIF locally with nix (forcing rebuild)...")
-	nixCmd := exec.Command("nix", "build", "--impure", "--rebuild", ".#eif")
-	nixCmd.Dir = repoPath
-	nixCmd.Stderr = os.Stderr
-
-	env := os.Environ()
-	if version != "" {
-		env = append(env, "VERSION="+version)
+	absRepo, err := filepath.Abs(repoPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve repo path: %w", err)
 	}
-	if region != "" {
-		env = append(env, "AWS_REGION="+region)
-	}
-	nixCmd.Env = env
 
-	if err := nixCmd.Run(); err != nil {
-		return "", fmt.Errorf("nix build failed: %w", err)
+	// Clean stale artifacts.
+	resultPath := absRepo + "/artifacts"
+	_ = os.RemoveAll(resultPath)
+	_ = os.MkdirAll(resultPath, 0o755)
+
+	// Build the EIF reproducibly via pinned NixOS Docker image.
+	// Copy outputs from nix store before the container exits (the store is ephemeral).
+	fmt.Println("[verify] building EIF via NixOS Docker (reproducible)...")
+	nixImage := os.Getenv("NIX_IMAGE")
+	if nixImage == "" {
+		nixImage = "nixos/nix:2.24.9"
+	}
+	if version == "" {
+		version = "dev"
+	}
+	if region == "" {
+		region = "us-east-1"
+	}
+
+	dockerCmd := exec.Command("docker", "run", "--rm",
+		"-v", absRepo+":/src", "-w", "/src",
+		"-e", "VERSION="+version,
+		"-e", "AWS_REGION="+region,
+		nixImage,
+		"sh", "-c",
+		"git config --global --add safe.directory /src && nix build --impure --extra-experimental-features 'nix-command flakes' ./builder#eif && cp result/image.eif /src/artifacts/image.eif && cp result/pcr.json /src/artifacts/pcr.json",
+	)
+	dockerCmd.Stdout = os.Stdout
+	dockerCmd.Stderr = os.Stderr
+
+	if err := dockerCmd.Run(); err != nil {
+		return "", fmt.Errorf("docker nix build failed: %w", err)
 	}
 
 	// Read PCR values from the build output.
@@ -245,38 +260,31 @@ func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) (*nitr
 }
 
 // verifyPubkeyBinding fetches the signer pubkey from /v1/info and verifies
-// that its SHA256 hash matches the appKeyHash embedded in the attestation
-// document's UserData field (set by nitriding from POST /enclave/hash).
+// that its hash matches PCR16 in the attestation document.
 //
-// Nitriding's UserData format (AttestationHashes.Serialize()):
-//
-//	[0x12, 0x20, <tlsKeyHash:32 bytes>, 0x12, 0x20, <appKeyHash:32 bytes>]
-//
-// Total: 68 bytes.  The appKeyHash starts at offset 34.
+// The enclave extends PCR16 with SHA256(compressedPubkey) and locks it.
+// PCR extension: new = SHA384(old || data), starting from 48 zero bytes.
+// So: PCR16 = SHA384(zeros_48 || SHA256(pubkey))
 func verifyPubkeyBinding(client *http.Client, baseURL string, attestResult *nitrite.Result) error {
 	if attestResult == nil || attestResult.Document == nil {
 		return fmt.Errorf("no attestation result to verify against")
 	}
 
-	userData := attestResult.Document.UserData
-	// Nitriding serializes two multihash-prefixed SHA256 hashes: 2*(2+32) = 68 bytes
-	if len(userData) < 68 {
-		return fmt.Errorf("attestation UserData too short (%d bytes, expected >= 68); nitriding may not have received the app key hash", len(userData))
+	pcr16, ok := attestResult.Document.PCRs[16]
+	if !ok || len(pcr16) == 0 {
+		return fmt.Errorf("attestation missing PCR16; enclave did not extend PCR16 with pubkey hash")
 	}
 
-	// Extract appKeyHash: skip multihash prefix (2 bytes) + tlsKeyHash (32 bytes) + multihash prefix (2 bytes)
-	appKeyHash := userData[36:68]
-
-	// Check that appKeyHash is not all zeros (meaning the app never registered a pubkey)
+	// Check that PCR16 is not all zeros (meaning the enclave never extended it)
 	allZero := true
-	for _, b := range appKeyHash {
+	for _, b := range pcr16 {
 		if b != 0 {
 			allZero = false
 			break
 		}
 	}
 	if allZero {
-		return fmt.Errorf("attestation appKeyHash is all zeros; enclave did not register its signing pubkey")
+		return fmt.Errorf("attestation PCR16 is all zeros; enclave did not register its signing pubkey")
 	}
 
 	// Fetch the signer pubkey from /v1/info
@@ -307,54 +315,59 @@ func verifyPubkeyBinding(client *http.Client, baseURL string, attestResult *nitr
 		return fmt.Errorf("decode signer pubkey hex: %w", err)
 	}
 
-	// Compute SHA256 of the compressed public key and compare
-	computedHash := sha256.Sum256(pubkeyBytes)
-	if !bytes.Equal(computedHash[:], appKeyHash) {
-		return fmt.Errorf("pubkey binding mismatch: SHA256(%s) = %s, but attestation appKeyHash = %s",
+	// Compute expected PCR16: SHA384(zeros_48 || SHA256(pubkey))
+	pubkeyHash := sha256.Sum256(pubkeyBytes)
+	extendData := make([]byte, 48+len(pubkeyHash))
+	// First 48 bytes are zeros (initial PCR16 value)
+	copy(extendData[48:], pubkeyHash[:])
+	expectedPCR16 := sha512.Sum384(extendData)
+
+	if !bytes.Equal(expectedPCR16[:], pcr16) {
+		return fmt.Errorf("PCR16 mismatch: expected SHA384(zeros48 || SHA256(%s)) = %s, got %s",
 			info.SignerPubkey,
-			hex.EncodeToString(computedHash[:]),
-			hex.EncodeToString(appKeyHash))
+			hex.EncodeToString(expectedPCR16[:]),
+			hex.EncodeToString(pcr16))
 	}
 
-	fmt.Printf("pubkey binding verified: %s attested in enclave\n", info.SignerPubkey)
+	fmt.Printf("pubkey binding verified via PCR16: %s attested in enclave\n", info.SignerPubkey)
 	return nil
 }
 
-func submitTx(client *http.Client, baseURL, arkTx, checkpointTx string) error {
-	if arkTx == "" {
-		arkTx = "demo-ark-tx"
-	}
-	if checkpointTx == "" {
-		checkpointTx = "demo-checkpoint-tx"
-	}
+// func submitTx(client *http.Client, baseURL, arkTx, checkpointTx string) error {
+// 	if arkTx == "" {
+// 		arkTx = "demo-ark-tx"
+// 	}
+// 	if checkpointTx == "" {
+// 		checkpointTx = "demo-checkpoint-tx"
+// 	}
 
-	body, err := json.Marshal(submitTxRequest{
-		ArkTx:         arkTx,
-		CheckpointTxs: []string{checkpointTx},
-	})
-	if err != nil {
-		return err
-	}
+// 	body, err := json.Marshal(submitTxRequest{
+// 		ArkTx:         arkTx,
+// 		CheckpointTxs: []string{checkpointTx},
+// 	})
+// 	if err != nil {
+// 		return err
+// 	}
 
-	url := strings.TrimRight(baseURL, "/") + "/v1/tx"
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Content-Type", "application/json")
+// 	url := strings.TrimRight(baseURL, "/") + "/v1/tx"
+// 	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, bytes.NewReader(body))
+// 	if err != nil {
+// 		return err
+// 	}
+// 	req.Header.Set("Content-Type", "application/json")
 
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
+// 	resp, err := client.Do(req)
+// 	if err != nil {
+// 		return err
+// 	}
+// 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		payload, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("tx status %d: %s", resp.StatusCode, strings.TrimSpace(string(payload)))
-	}
+// 	if resp.StatusCode != http.StatusOK {
+// 		payload, _ := io.ReadAll(resp.Body)
+// 		return fmt.Errorf("tx status %d: %s", resp.StatusCode, strings.TrimSpace(string(payload)))
+// 	}
 
-	respBody, _ := io.ReadAll(resp.Body)
-	fmt.Printf("tx response: %s\n", strings.TrimSpace(string(respBody)))
-	return nil
-}
+// 	respBody, _ := io.ReadAll(resp.Body)
+// 	fmt.Printf("tx response: %s\n", strings.TrimSpace(string(respBody)))
+// 	return nil
+// }

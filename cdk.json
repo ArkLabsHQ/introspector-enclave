@@ -1,1 +1,1 @@
-{"app": "bash -c 'export CDK_OUTDIR=$(pwd)/cdk.out && cd cdk && go run .'", "context": {}}
+{"app": "bash -c 'export CDK_OUTDIR=$(pwd)/cdk.out && cd builder && go run .'", "context": {}}
