@@ -82,22 +82,14 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	// The EIF is built by Nix (nix build .#eif) before CDK deploy.
 	// Upload the pre-built, reproducible EIF to S3.
 	enclaveEif := awss3assets.NewAsset(stack, jsii.String("EnclaveEIF"), &awss3assets.AssetProps{
-		Path: jsii.String(repoPath("result/image.eif")),
+		Path: jsii.String(repoPath("artifacts/image.eif")),
 	})
 
-	watchdog := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveWatchdog"), &awss3assets.AssetProps{
-		Path: jsii.String(repoRoot),
-		Bundling: &awscdk.BundlingOptions{
-			Image: awscdk.DockerImage_FromRegistry(jsii.String("golang:1.25.5")),
-			Command: &[]*string{
-				jsii.String("/bin/sh"),
-				jsii.String("-c"),
-				jsii.String("GOCACHE=/tmp/go-cache GOPATH=/tmp/go CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /asset-output/watchdog ./cmd/watchdog"),
-			},
-		},
+	enclaveInit := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveInit"), &awss3assets.AssetProps{
+		Path: jsii.String(repoPath("enclave/enclave_init.sh")),
 	})
 
-	watchdogSystemd := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveWatchdogService"), &awss3assets.AssetProps{
+	enclaveInitSystemd := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveInitService"), &awss3assets.AssetProps{
 		Path: jsii.String(repoPath("enclave/systemd/enclave-watchdog.service")),
 	})
 
@@ -197,8 +189,8 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		awsiam.ManagedPolicy_FromAwsManagedPolicyName(jsii.String("AmazonSSMManagedInstanceCore")),
 	)
 
-	watchdog.GrantRead(role)
-	watchdogSystemd.GrantRead(role)
+	enclaveInit.GrantRead(role)
+	enclaveInitSystemd.GrantRead(role)
 	imdsSystemd.GrantRead(role)
 	gvproxySystemd.GrantRead(role)
 	secretCiphertextParam.GrantRead(role)
@@ -217,15 +209,15 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		"__DEV_MODE__":                jsii.String(deployment),
 		"__GVPROXY_IMAGE_URI__":       outboundProxyImage.ImageUri(),
 		"__EIF_S3_URL__":              enclaveEif.S3ObjectUrl(),
-		"__WATCHDOG_S3_URL__":         watchdog.S3ObjectUrl(),
-		"__WATCHDOG_SYSTEMD_S3_URL__": watchdogSystemd.S3ObjectUrl(),
+		"__ENCLAVE_INIT_S3_URL__":         enclaveInit.S3ObjectUrl(),
+		"__ENCLAVE_INIT_SYSTEMD_S3_URL__": enclaveInitSystemd.S3ObjectUrl(),
 		"__IMDS_SYSTEMD_S3_URL__":     imdsSystemd.S3ObjectUrl(),
 		"__GVPROXY_SYSTEMD_S3_URL__":  gvproxySystemd.S3ObjectUrl(),
 		"__REGION__":                  stack.Region(),
 		"__KMS_KEY_ID__":              encryptionKey.KeyId(),
 	}
 
-	userDataRaw := awscdk.Fn_Sub(jsii.String(readFileOrPanic(repoPath("user_data/user_data"))), &mappings)
+	userDataRaw := awscdk.Fn_Sub(jsii.String(readFileOrPanic(repoPath("enclave/user_data/user_data"))), &mappings)
 
 	enclaveEif.GrantRead(role)
 	outboundProxyImage.Repository().GrantPull(role)

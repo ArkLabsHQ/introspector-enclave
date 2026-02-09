@@ -20,23 +20,22 @@
 
         # Filter source to only include files relevant to the Go build.
         src = pkgs.lib.cleanSourceWith {
-          src = ./.;
+          src = ../enclave;
           filter = path: type:
             let
-              relPath = pkgs.lib.removePrefix (toString ./. + "/") (toString path);
               isGoFile = pkgs.lib.hasSuffix ".go" path;
               isGoMod = builtins.baseNameOf path == "go.mod" || builtins.baseNameOf path == "go.sum";
-              isInternal = pkgs.lib.hasPrefix "internal/" relPath;
             in
-              type == "directory" || isGoFile || isGoMod || isInternal;
+              type == "directory" || isGoFile || isGoMod;
         };
 
-        # Main application binary.
-        introspector = pkgs.buildGoModule {
-          pname = "introspector-skeleton";
+        # Init binary: decrypts key via KMS, extends PCR16 with pubkey hash,
+        # then exec's the real introspector binary.
+        introspector-init = pkgs.buildGoModule {
+          pname = "introspector-init";
           inherit version src;
 
-          vendorHash = "sha256-0MjCpjOOt1T/vNpUXEHSDj+gjzNOXZTZzUti36JF3cA=";
+          vendorHash = "sha256-50QaMGcKse0dm6BtG/3q1V9GUQmm4GqRARXewvNSfiw=";
 
           subPackages = [ "." ];
           env.CGO_ENABLED = "0";
@@ -45,6 +44,36 @@
           # Deterministic build flags.
           buildFlags = [ "-trimpath" ];
           tags = [ "netgo" ];
+
+          postInstall = ''
+            mv $out/bin/introspector-enclave $out/bin/introspector-init
+          '';
+        };
+
+        # Upstream introspector binary (full signing service).
+        # Built from ArkLabsHQ/introspector source at a pinned commit.
+        introspector-upstream = pkgs.buildGoModule {
+          pname = "introspector";
+          version = "unstable-2026-01-29";
+
+          src = pkgs.fetchFromGitHub {
+            owner = "ArkLabsHQ";
+            repo = "introspector";
+            rev = "dcec46c447261a0dc7895cae7771283fafc803d2";
+            hash = "sha256-3Ce/GX4O2Mg0PH82ESGx7MMYJw+mYZnnrIkdCHTVluI=";
+          };
+
+          vendorHash = "sha256-Zk7onQE+KLrctHt4H5NBfxorySkl+dzkPOhRRky8yI4=";
+
+          subPackages = [ "cmd" ];
+          env.CGO_ENABLED = "0";
+          buildFlags = [ "-trimpath" ];
+          tags = [ "netgo" ];
+          doCheck = false;
+
+          postInstall = ''
+            mv $out/bin/cmd $out/bin/introspector
+          '';
         };
 
         # Nitriding TLS termination daemon.
@@ -95,10 +124,11 @@
         # Assemble the /app directory with all binaries and scripts.
         appDir = pkgs.runCommand "enclave-app" { } ''
           mkdir -p $out/app/data
-          cp ${introspector}/bin/introspector $out/app/introspector-skeleton
+          cp ${introspector-init}/bin/introspector-init $out/app/introspector-init
+          cp ${introspector-upstream}/bin/introspector $out/app/introspector
           cp ${nitriding}/bin/nitriding $out/app/nitriding
           cp ${viproxy}/bin/proxy $out/app/proxy
-          install -m 0755 ${./enclave/start.sh} $out/app/start.sh
+          install -m 0755 ${../enclave/start.sh} $out/app/start.sh
         '';
 
         # Complete rootfs for the enclave.
@@ -161,7 +191,7 @@
       in
       {
         packages = {
-          inherit introspector nitriding viproxy enclave-image eif;
+          inherit introspector-init introspector-upstream nitriding viproxy enclave-image eif;
           default = eif;
         };
       }
