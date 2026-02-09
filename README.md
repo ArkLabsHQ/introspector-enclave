@@ -186,6 +186,21 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 | `nitriding`            | TLS termination + attestation daemon           |
 | `viproxy`              | IMDS forwarding for enclave                    |
 | `eif`                  | Complete enclave image (default)               |
+Use `-insecure` to skip TLS verification during development.
+
+## Reproducible Build Verification
+
+The enclave image is built with [Nix](https://nixos.org/) using `dockerTools.buildImage`, which produces a byte-identical Docker image on every build. This eliminates non-determinism from Docker layer ordering and guarantees identical PCR0 measurements.
+
+### Build the EIF (reproducible, via Docker)
+
+Build the enclave EIF image and output its PCR values:
+
+```sh
+./scripts/build_eif.sh
+```
+
+Override defaults with `VERSION` and `AWS_REGION` environment variables.
 
 ### Verify a running enclave
 
