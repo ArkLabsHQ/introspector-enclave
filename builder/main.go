@@ -243,6 +243,15 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	cfnInstance := instance.Node().DefaultChild().(awsec2.CfnInstance)
 	cfnInstance.AddPropertyOverride(jsii.String("EnclaveOptions.Enabled"), jsii.Bool(true))
 
+	// Elastic IP gives the instance a static public address that survives reboots.
+	eip := awsec2.NewCfnEIP(stack, jsii.String("EnclaveEIP"), &awsec2.CfnEIPProps{
+		Domain: jsii.String("vpc"),
+	})
+	awsec2.NewCfnEIPAssociation(stack, jsii.String("EnclaveEIPAssoc"), &awsec2.CfnEIPAssociationProps{
+		AllocationId: eip.AttrAllocationId(),
+		InstanceId:   instance.InstanceId(),
+	})
+
 	kmsKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("KMSKeyID"), &awsssm.StringParameterProps{
 		StringValue:   encryptionKey.KeyId(),
 		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/KMSKeyID", deployment)),
@@ -267,6 +276,11 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	awscdk.NewCfnOutput(stack, jsii.String("Instance ID"), &awscdk.CfnOutputProps{
 		Value:       instance.InstanceId(),
 		Description: jsii.String("EC2 Instance ID"),
+	})
+
+	awscdk.NewCfnOutput(stack, jsii.String("Elastic IP"), &awscdk.CfnOutputProps{
+		Value:       eip.Ref(),
+		Description: jsii.String("Static public IP for the enclave instance"),
 	})
 
 	return stack

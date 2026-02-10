@@ -160,10 +160,10 @@ This script:
 ### 4. Verify the enclave
 
 ```sh
-INSECURE_TLS=1 ./scripts/call.sh
+./scripts/call.sh
 ```
 
-This verifies the enclave's attestation document and pubkey binding via PCR16. Use `INSECURE_TLS=1` because the enclave's self-signed TLS cert won't have IP SANs (trust comes from attestation, not TLS).
+This verifies the enclave's attestation document and pubkey binding via PCR16. TLS certificate verification is skipped by default since attestation is the trust anchor.
 
 ### 5. (Optional) Lock the KMS key permanently
 
@@ -186,22 +186,6 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 | `nitriding`            | TLS termination + attestation daemon           |
 | `viproxy`              | IMDS forwarding for enclave                    |
 | `eif`                  | Complete enclave image (default)               |
-Use `-insecure` to skip TLS verification during development.
-
-## Reproducible Build Verification
-
-The enclave image is built with [Nix](https://nixos.org/) using `dockerTools.buildImage`, which produces a byte-identical Docker image on every build. This eliminates non-determinism from Docker layer ordering and guarantees identical PCR0 measurements.
-
-### Build the EIF (reproducible, via Docker)
-
-Build the enclave EIF image and output its PCR values:
-
-```sh
-./scripts/build_eif.sh
-```
-
-Override defaults with `VERSION` and `AWS_REGION` environment variables.
-
 ### Verify a running enclave
 
 The client can build the EIF locally via Docker and compare PCR0 against the running enclave's attestation:
@@ -212,8 +196,7 @@ cd client && go run . \
   --verify-build \
   --repo-path /path/to/introspector-enclave \
   --build-version dev \
-  --build-region us-east-1 \
-  --insecure
+  --build-region us-east-1
 ```
 
 ## Client
@@ -223,8 +206,7 @@ The included client (`client/`) verifies the enclave's attestation document and 
 ```sh
 cd client && go run . \
   --base-url https://<enclave-ip> \
-  --expected-pcr0 <hex> \
-  --insecure
+  --expected-pcr0 <hex>
 ```
 
 The client:
@@ -233,7 +215,7 @@ The client:
 2. Verifies the attestation signature and PCR0
 3. Fetches `/v1/info` and verifies `SHA384(zeros_48 || SHA256(pubkey))` matches attestation `PCRs[16]`
 
-Use `--insecure` to skip TLS verification (trust comes from attestation). Use `--verify-pubkey=false` to skip step 3.
+TLS certificate verification is skipped by default (trust comes from attestation). Use `--strict-tls` to require a CA-signed certificate. Use `--verify-pubkey=false` to skip step 3.
 
 ## Configuration
 

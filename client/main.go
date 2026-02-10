@@ -46,7 +46,7 @@ type nitroBuildOutput struct {
 
 func main() {
 	baseURL := flag.String("base-url", "", "Base URL for the enclave (e.g., https://host)")
-	insecure := flag.Bool("insecure", false, "Skip TLS verification")
+	strictTLS := flag.Bool("strict-tls", false, "Require CA-signed TLS certificate (default: skip, trust attestation instead)")
 	expectedPCR0 := flag.String("expected-pcr0", "", "Expected PCR0 hex (optional)")
 	verifyBuild := flag.Bool("verify-build", false, "Build enclave EIF locally with Nix and derive expected PCR0")
 	repoPath := flag.String("repo-path", ".", "Path to source repository (used with --verify-build)")
@@ -76,7 +76,7 @@ func main() {
 		}
 	}
 
-	client := httpClient(*insecure)
+	client := httpClient(!*strictTLS)
 
 	attestResult, err := verifyAttestation(client, *baseURL, pcr0)
 	if err != nil {
