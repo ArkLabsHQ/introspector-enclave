@@ -106,6 +106,41 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/SecretKeyCiphertext", deployment)),
 	})
 
+	// Migration SSM parameters.
+	migrationStateParam := awsssm.NewStringParameter(stack, jsii.String("MigrationState"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationState", deployment)),
+	})
+
+	v2CiphertextParam := awsssm.NewStringParameter(stack, jsii.String("V2SecretKeyCiphertext"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/V2SecretKeyCiphertext", deployment)),
+	})
+
+	// V2 KMS key (created during initial deploy so it's available for V2 migration).
+	// The V2 key policy is applied externally by deploy_v2.sh with the V2 PCR0.
+	encryptionKeyV2 := awskms.NewKey(stack, jsii.String("EncryptionKeyV2"), &awskms.KeyProps{
+		EnableKeyRotation: jsii.Bool(true),
+		Description:       jsii.String("KMS key for V2 enclave migration"),
+	})
+	encryptionKeyV2.ApplyRemovalPolicy(awscdk.RemovalPolicy_DESTROY)
+
+	v2KmsKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("V2KMSKeyID"), &awsssm.StringParameterProps{
+		StringValue:   encryptionKeyV2.KeyId(),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/V2KMSKeyID", deployment)),
+	})
+
+	// Maintainer authorization parameters (set by deploy_v2.sh before starting V2).
+	maintainerSigParam := awsssm.NewStringParameter(stack, jsii.String("MaintainerSig"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MaintainerSig", deployment)),
+	})
+
+	migrationActivationTimeParam := awsssm.NewStringParameter(stack, jsii.String("MigrationActivationTime"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationActivationTime", deployment)),
+	})
+
 	vpc := awsec2.NewVpc(stack, jsii.String("VPC"), &awsec2.VpcProps{
 		NatGateways: jsii.Number(1),
 		SubnetConfiguration: &[]*awsec2.SubnetConfiguration{
@@ -196,6 +231,20 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	secretCiphertextParam.GrantRead(role)
 	secretCiphertextParam.GrantWrite(role)
 
+	// Migration parameter permissions.
+	migrationStateParam.GrantRead(role)
+	migrationStateParam.GrantWrite(role)
+	v2CiphertextParam.GrantRead(role)
+	v2CiphertextParam.GrantWrite(role)
+	v2KmsKeyIDParam.GrantRead(role)
+
+	// Maintainer auth parameter permissions.
+	maintainerSigParam.GrantRead(role)
+	migrationActivationTimeParam.GrantRead(role)
+
+	// V2 KMS key: EC2 role needs Encrypt (V1 re-encrypts to V2 key) and Decrypt (V2 decrypts its key).
+	encryptionKeyV2.GrantEncryptDecrypt(role)
+
 	blockDevice := awsec2.BlockDevice{
 		DeviceName: jsii.String("/dev/xvda"),
 		Volume: awsec2.BlockDeviceVolume_Ebs(jsii.Number(32), &awsec2.EbsDeviceOptions{
@@ -267,6 +316,11 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	awscdk.NewCfnOutput(stack, jsii.String("Instance ID"), &awscdk.CfnOutputProps{
 		Value:       instance.InstanceId(),
 		Description: jsii.String("EC2 Instance ID"),
+	})
+
+	awscdk.NewCfnOutput(stack, jsii.String("V2 KMS Key ID"), &awscdk.CfnOutputProps{
+		Value:       encryptionKeyV2.KeyId(),
+		Description: jsii.String("V2 KMS Key ID (for migration)"),
 	})
 
 	return stack

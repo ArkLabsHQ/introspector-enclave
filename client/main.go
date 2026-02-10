@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/hf/nitrite"
 )
 
@@ -53,6 +54,8 @@ func main() {
 	buildVersion := flag.String("build-version", "", "VERSION for nix build (used with --verify-build)")
 	buildRegion := flag.String("build-region", "", "AWS_REGION for nix build (used with --verify-build)")
 	verifyPubkey := flag.Bool("verify-pubkey", true, "Verify that /v1/info pubkey matches attestation PCR16 hash")
+	verifyAttestationKey := flag.Bool("verify-attestation-key", true, "Verify attestation key via UserData appKeyHash and test response signature")
+	checkMigration := flag.Bool("check-migration", false, "Check migration status from /v1/migration-status")
 	flag.Parse()
 
 	if *baseURL == "" {
@@ -87,6 +90,20 @@ func main() {
 	if *verifyPubkey {
 		if err := verifyPubkeyBinding(client, *baseURL, attestResult); err != nil {
 			fmt.Fprintf(os.Stderr, "pubkey binding verification failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if *verifyAttestationKey {
+		if err := verifyAttestationKeyBinding(client, *baseURL, attestResult); err != nil {
+			fmt.Fprintf(os.Stderr, "attestation key verification failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if *checkMigration {
+		if err := checkMigrationStatus(client, *baseURL); err != nil {
+			fmt.Fprintf(os.Stderr, "migration status check failed: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -331,6 +348,258 @@ func verifyPubkeyBinding(client *http.Client, baseURL string, attestResult *nitr
 
 	fmt.Printf("pubkey binding verified via PCR16: %s attested in enclave\n", info.SignerPubkey)
 	return nil
+}
+
+// verifyAttestationKeyBinding verifies the enclave's ephemeral attestation key
+// by checking that the pubkey from /v1/enclave-info matches the appKeyHash in
+// the attestation document's UserData, then verifying a live response signature.
+//
+// UserData format (nitriding): [0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:32]
+// Total 68 bytes. appKeyHash is at bytes 36:68 (after the 2nd multihash prefix).
+func verifyAttestationKeyBinding(client *http.Client, baseURL string, attestResult *nitrite.Result) error {
+	if attestResult == nil || attestResult.Document == nil {
+		return fmt.Errorf("no attestation result to verify against")
+	}
+
+	userData := attestResult.Document.UserData
+	if len(userData) < 68 {
+		fmt.Println("attestation key: UserData too short for appKeyHash (enclave may not support attestation key)")
+		return nil
+	}
+
+	// Extract appKeyHash from UserData at offset 36 (after 2nd multihash prefix 0x12, 0x20).
+	if userData[34] != 0x12 || userData[35] != 0x20 {
+		return fmt.Errorf("UserData missing multihash prefix at offset 34 (got %02x %02x)", userData[34], userData[35])
+	}
+	appKeyHash := userData[36:68]
+
+	// Check if appKeyHash is all zeros (no attestation key registered).
+	allZero := true
+	for _, b := range appKeyHash {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		fmt.Println("attestation key: appKeyHash is all zeros (attestation key not registered)")
+		return nil
+	}
+
+	// Fetch enclave info to get the attestation pubkey.
+	info, err := fetchEnclaveInfo(client, baseURL)
+	if err != nil {
+		return fmt.Errorf("fetch enclave info: %w", err)
+	}
+	if info.AttestationPubkey == "" {
+		return fmt.Errorf("enclave reports no attestation pubkey but appKeyHash is set")
+	}
+
+	attestPubkeyBytes, err := hex.DecodeString(info.AttestationPubkey)
+	if err != nil {
+		return fmt.Errorf("decode attestation pubkey hex: %w", err)
+	}
+
+	// Verify: SHA256(attestation_pubkey) == appKeyHash from UserData
+	expectedHash := sha256.Sum256(attestPubkeyBytes)
+	if !bytes.Equal(expectedHash[:], appKeyHash) {
+		return fmt.Errorf("appKeyHash mismatch: expected SHA256(%s) = %s, got %s",
+			info.AttestationPubkey,
+			hex.EncodeToString(expectedHash[:]),
+			hex.EncodeToString(appKeyHash))
+	}
+
+	fmt.Printf("attestation key binding verified via appKeyHash: %s\n", info.AttestationPubkey)
+
+	// Verify a live response signature from /v1/enclave-info.
+	if err := verifyResponseSignature(client, baseURL, info.AttestationPubkey); err != nil {
+		return fmt.Errorf("response signature verification: %w", err)
+	}
+
+	return nil
+}
+
+// verifyResponseSignature fetches /v1/enclave-info and verifies the
+// X-Attestation-Signature header against the attestation pubkey.
+func verifyResponseSignature(client *http.Client, baseURL, attestPubkeyHex string) error {
+	infoURL := strings.TrimRight(baseURL, "/") + "/v1/enclave-info"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, infoURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
+	}
+
+	sigHex := resp.Header.Get("X-Attestation-Signature")
+	if sigHex == "" {
+		return fmt.Errorf("response missing X-Attestation-Signature header")
+	}
+
+	// Parse the x-only pubkey for Schnorr verification.
+	pubkeyBytes, err := hex.DecodeString(attestPubkeyHex)
+	if err != nil {
+		return fmt.Errorf("decode pubkey: %w", err)
+	}
+	// The attestation pubkey is compressed (33 bytes). Extract x-only (32 bytes)
+	// by dropping the prefix byte.
+	if len(pubkeyBytes) == 33 {
+		pubkeyBytes = pubkeyBytes[1:]
+	}
+	pubkey, err := schnorr.ParsePubKey(pubkeyBytes)
+	if err != nil {
+		return fmt.Errorf("parse attestation pubkey: %w", err)
+	}
+
+	sigBytes, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return fmt.Errorf("decode signature hex: %w", err)
+	}
+	sig, err := schnorr.ParseSignature(sigBytes)
+	if err != nil {
+		return fmt.Errorf("parse signature: %w", err)
+	}
+
+	msgHash := sha256.Sum256(body)
+	if !sig.Verify(msgHash[:], pubkey) {
+		return fmt.Errorf("signature verification failed")
+	}
+
+	fmt.Println("response signature verified (X-Attestation-Signature valid)")
+	return nil
+}
+
+type migrationStatusResponse struct {
+	State *struct {
+		TargetPCR0     string `json:"target_pcr0"`
+		V2KMSKeyID     string `json:"v2_kms_key_id"`
+		InitiatedAt    int64  `json:"initiated_at"`
+		CompletedAt    int64  `json:"completed_at,omitempty"`
+		SourcePCR0     string `json:"source_pcr0,omitempty"`
+		PreviousPCR0   string `json:"previous_pcr0,omitempty"`
+		ActivationTime int64  `json:"activation_time,omitempty"`
+	} `json:"state"`
+	CooldownExpired bool `json:"cooldown_expired,omitempty"`
+}
+
+type enclaveInfoResponse struct {
+	Version           string `json:"version"`
+	PreviousPCR0      string `json:"previous_pcr0"`
+	MaintainerPubkey  string `json:"maintainer_pubkey,omitempty"`
+	AttestationPubkey string `json:"attestation_pubkey,omitempty"`
+}
+
+func checkMigrationStatus(client *http.Client, baseURL string) error {
+	// Fetch enclave info (attestation chain metadata).
+	if info, err := fetchEnclaveInfo(client, baseURL); err == nil {
+		fmt.Printf("enclave info:\n")
+		fmt.Printf("  version:           %s\n", info.Version)
+		fmt.Printf("  previous PCR0:     %s\n", info.PreviousPCR0)
+		if info.MaintainerPubkey != "" {
+			fmt.Printf("  maintainer pubkey: %s\n", info.MaintainerPubkey)
+		} else {
+			fmt.Printf("  maintainer pubkey: (not configured)\n")
+		}
+		if info.AttestationPubkey != "" {
+			fmt.Printf("  attestation key:   %s\n", info.AttestationPubkey)
+		}
+		fmt.Println()
+	} else {
+		fmt.Fprintf(os.Stderr, "warning: could not fetch /v1/enclave-info: %v\n", err)
+	}
+
+	// Fetch migration status.
+	statusURL := strings.TrimRight(baseURL, "/") + "/v1/migration-status"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, statusURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("migration-status status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var status migrationStatusResponse
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return fmt.Errorf("decode migration status: %w", err)
+	}
+
+	if status.State == nil {
+		fmt.Println("migration status: no migration pending")
+		return nil
+	}
+
+	initiated := time.Unix(status.State.InitiatedAt, 0)
+	fmt.Printf("migration status:\n")
+	fmt.Printf("  target PCR0:     %s\n", status.State.TargetPCR0)
+	fmt.Printf("  V2 KMS key:      %s\n", status.State.V2KMSKeyID)
+	fmt.Printf("  initiated at:    %s\n", initiated.Format(time.RFC3339))
+
+	// Attestation chain info from migration state.
+	if status.State.SourcePCR0 != "" {
+		fmt.Printf("  source PCR0:     %s\n", status.State.SourcePCR0)
+	}
+	if status.State.PreviousPCR0 != "" {
+		fmt.Printf("  chain prev PCR0: %s\n", status.State.PreviousPCR0)
+	}
+	if status.State.ActivationTime != 0 {
+		fmt.Printf("  activation time: %s\n", time.Unix(status.State.ActivationTime, 0).Format(time.RFC3339))
+	}
+
+	if status.State.CompletedAt != 0 {
+		completed := time.Unix(status.State.CompletedAt, 0)
+		fmt.Printf("  completed at:    %s\n", completed.Format(time.RFC3339))
+		fmt.Println("  status:          COMPLETED")
+	} else if status.CooldownExpired {
+		fmt.Println("  cooldown:        EXPIRED (ready for completion)")
+	} else {
+		cooldownEnd := initiated.Add(24 * time.Hour)
+		remaining := time.Until(cooldownEnd)
+		fmt.Printf("  cooldown until:  %s (%s remaining)\n", cooldownEnd.Format(time.RFC3339), remaining.Round(time.Second))
+		fmt.Println("  status:          PENDING")
+	}
+
+	return nil
+}
+
+func fetchEnclaveInfo(client *http.Client, baseURL string) (*enclaveInfoResponse, error) {
+	infoURL := strings.TrimRight(baseURL, "/") + "/v1/enclave-info"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, infoURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var info enclaveInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("decode enclave info: %w", err)
+	}
+	return &info, nil
 }
 
 // func submitTx(client *http.Client, baseURL, arkTx, checkpointTx string) error {

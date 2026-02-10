@@ -14,6 +14,10 @@ fi
 
 export INTROSPECTOR_NO_TLS=true
 
+# V2 migration mode: INTROSPECTOR_V1_CID is set by the V2 deployment
+# to tell this enclave to obtain its key from V1 via the migration protocol.
+# This env var is passed through to introspector-init.
+
 # The AWS SDK needs a region. Inside the enclave, IMDS region detection
 # may fail, so we set it explicitly from the deployment config.
 if [ -z "${AWS_DEFAULT_REGION:-}" ]; then

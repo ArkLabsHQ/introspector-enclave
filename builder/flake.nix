@@ -13,10 +13,16 @@
         pkgs = import nixpkgs { inherit system; };
         nitro = aws-nitro-util.lib.${system};
 
-        # Pass VERSION and AWS_REGION via environment when building:
+        # Pass build-time variables via environment when building:
         #   VERSION=dev AWS_REGION=us-east-1 nix build --impure .#eif
+        #
+        # For migration support, also set:
+        #   PREVIOUS_PCR0=<hex>         PCR0 of the previous enclave (or "genesis")
+        #   MAINTAINER_PUBKEY=<hex>     32-byte x-only Schnorr pubkey for migration auth
         version = let v = builtins.getEnv "VERSION"; in if v == "" then "dev" else v;
         region = let r = builtins.getEnv "AWS_REGION"; in if r == "" then "us-east-1" else r;
+        previousPCR0 = let p = builtins.getEnv "PREVIOUS_PCR0"; in if p == "" then "genesis" else p;
+        maintainerPubkey = builtins.getEnv "MAINTAINER_PUBKEY";
 
         # Filter source to only include files relevant to the Go build.
         src = pkgs.lib.cleanSourceWith {
@@ -35,11 +41,16 @@
           pname = "introspector-init";
           inherit version src;
 
-          vendorHash = "sha256-50QaMGcKse0dm6BtG/3q1V9GUQmm4GqRARXewvNSfiw=";
+          vendorHash = "sha256-LrWKwvHdY0+k2BEEyETVCFgX0T6r0jB2bM6/G/yg2x0=";
 
           subPackages = [ "." ];
           env.CGO_ENABLED = "0";
-          ldflags = [ "-X" "main.Version=${version}" ];
+          ldflags = [
+            "-X" "main.Version=${version}"
+            "-X" "main.PreviousPCR0=${previousPCR0}"
+          ] ++ pkgs.lib.optionals (maintainerPubkey != "") [
+            "-X" "main.MaintainerPubkey=${maintainerPubkey}"
+          ];
 
           # Deterministic build flags.
           buildFlags = [ "-trimpath" ];
