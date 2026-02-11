@@ -253,7 +253,6 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 | `nitriding`            | TLS termination + attestation daemon           |
 | `viproxy`              | IMDS forwarding for enclave                    |
 | `eif`                  | Complete enclave image (default)               |
-<<<<<<< HEAD
 Use `-insecure` to skip TLS verification during development.
 
 ## Reproducible Build Verification
@@ -270,8 +269,6 @@ Build the enclave EIF image and output its PCR values:
 
 Override defaults with environment variables: `VERSION`, `AWS_REGION`.
 
-=======
->>>>>>> origin/master
 ### Verify a running enclave
 
 The client can build the EIF locally via Docker and compare PCR0 against the running enclave's attestation:
@@ -303,11 +300,7 @@ The client:
 4. Fetches `/v1/enclave-info` and verifies `SHA256(attestationPubkey)` matches the `appKeyHash` in the attestation document's UserData
 5. Verifies the `X-Attestation-Signature` header on the response against the attestation key
 
-<<<<<<< HEAD
-Use `--insecure` to skip TLS verification (trust comes from attestation). Use `--verify-pubkey=false` to skip step 3. Use `--verify-attestation-key=false` to skip steps 4-5.
-=======
 TLS certificate verification is skipped by default (trust comes from attestation). Use `--strict-tls` to require a CA-signed certificate. Use `--verify-pubkey=false` to skip step 3.
->>>>>>> origin/master
 
 ## Configuration
 
