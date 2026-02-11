@@ -524,12 +524,19 @@ else
   echo "[deploy] Waiting for instance ${instance_id} to be ready..."
   aws ec2 wait instance-status-ok --region "${region}" --instance-ids "${instance_id}"
 
+  elastic_ip=$(get_output "ElasticIP")
+  if [[ -z "${elastic_ip}" ]]; then
+    elastic_ip=$(get_output "Elastic IP")
+  fi
+
   echo ""
   echo "[deploy] Done."
   echo "  Instance ID: ${instance_id}"
   echo "  KMS Key ID:  ${kms_key_id}"
+  echo "  Elastic IP:  ${elastic_ip}"
   echo "  PCR0:        ${pcr0}"
+  echo ""
 
   # Lock the KMS key after the enclave is healthy.
   lock_kms_key "${kms_key_id}" "${pcr0}" "${ec2_role_arn}"
-fi
+

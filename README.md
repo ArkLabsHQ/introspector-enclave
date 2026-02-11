@@ -194,10 +194,10 @@ No SSH is required -- the deploy script orchestrates everything remotely via SSM
 ### 4. Verify the enclave
 
 ```sh
-INSECURE_TLS=1 ./scripts/call.sh
+./scripts/call.sh
 ```
 
-This verifies the enclave's attestation document and pubkey binding via PCR16. Use `INSECURE_TLS=1` because the enclave's self-signed TLS cert won't have IP SANs (trust comes from attestation, not TLS).
+This verifies the enclave's attestation document and pubkey binding via PCR16. TLS certificate verification is skipped by default since attestation is the trust anchor.
 
 ### 5. (Optional) Lock the KMS key permanently
 
@@ -253,6 +253,7 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 | `nitriding`            | TLS termination + attestation daemon           |
 | `viproxy`              | IMDS forwarding for enclave                    |
 | `eif`                  | Complete enclave image (default)               |
+<<<<<<< HEAD
 Use `-insecure` to skip TLS verification during development.
 
 ## Reproducible Build Verification
@@ -269,6 +270,8 @@ Build the enclave EIF image and output its PCR values:
 
 Override defaults with environment variables: `VERSION`, `AWS_REGION`.
 
+=======
+>>>>>>> origin/master
 ### Verify a running enclave
 
 The client can build the EIF locally via Docker and compare PCR0 against the running enclave's attestation:
@@ -279,8 +282,7 @@ cd client && go run . \
   --verify-build \
   --repo-path /path/to/introspector-enclave \
   --build-version dev \
-  --build-region us-east-1 \
-  --insecure
+  --build-region us-east-1
 ```
 
 ## Client
@@ -290,8 +292,7 @@ The included client (`client/`) verifies the enclave's attestation document and 
 ```sh
 cd client && go run . \
   --base-url https://<enclave-ip> \
-  --expected-pcr0 <hex> \
-  --insecure
+  --expected-pcr0 <hex>
 ```
 
 The client:
@@ -302,7 +303,11 @@ The client:
 4. Fetches `/v1/enclave-info` and verifies `SHA256(attestationPubkey)` matches the `appKeyHash` in the attestation document's UserData
 5. Verifies the `X-Attestation-Signature` header on the response against the attestation key
 
+<<<<<<< HEAD
 Use `--insecure` to skip TLS verification (trust comes from attestation). Use `--verify-pubkey=false` to skip step 3. Use `--verify-attestation-key=false` to skip steps 4-5.
+=======
+TLS certificate verification is skipped by default (trust comes from attestation). Use `--strict-tls` to require a CA-signed certificate. Use `--verify-pubkey=false` to skip step 3.
+>>>>>>> origin/master
 
 ## Configuration
 
