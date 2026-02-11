@@ -16,11 +16,9 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/hf/nsm"
@@ -30,17 +28,10 @@ import (
 
 var Version = "dev"
 
-// PreviousPCR0 is set at build time via -ldflags to the PCR0 of the previous
-// enclave version. This creates an immutable attestation chain: each binary
-// knows its predecessor, and clients can verify the full upgrade lineage.
-// Set to "genesis" for the very first enclave build.
+// PreviousPCR0 is the PCR0 of the previous enclave version, forming an
+// attestation chain. Set at runtime during migration (fetched from the old
+// enclave's attestation document), or defaults to "genesis" for first boot.
 var PreviousPCR0 = "genesis"
-
-// MaintainerPubkey is set at build time via -ldflags to the hex-encoded
-// x-only (32-byte) Schnorr public key of the maintainer(s) authorized to
-// approve software migrations. Can be a single key or a MuSig/FROST aggregate.
-// If empty, migration authorization signatures are not required (unsafe for production).
-var MaintainerPubkey = ""
 
 // attestationKey is an ephemeral secp256k1 key generated fresh each boot.
 // Its public key hash is registered with nitriding via POST /enclave/hash,
@@ -52,32 +43,21 @@ var attestationKey *btcec.PrivateKey
 const introspectorBin = "/app/introspector"
 
 func main() {
-	log.Infof("introspector-init %s starting (previous_pcr0=%s, maintainer=%s)",
-		Version, truncateHex(PreviousPCR0), truncateHex(MaintainerPubkey))
+	log.Infof("introspector-init %s starting", Version)
 
-	// V2 migration boot path: if INTROSPECTOR_V1_CID is set, this enclave
-	// is V2 and must obtain the signing key from V1 via the migration protocol.
-	if v1CIDStr := os.Getenv("INTROSPECTOR_V1_CID"); v1CIDStr != "" {
-		v1CID, err := strconv.ParseUint(v1CIDStr, 10, 32)
-		if err != nil {
-			log.Fatalf("invalid INTROSPECTOR_V1_CID: %s", err)
-		}
-		log.Infof("V2 mode: migrating key from V1 enclave (CID %d)", v1CID)
-		if err := connectToV1Migration(context.Background(), uint32(v1CID)); err != nil {
-			log.Fatalf("V2 migration failed: %s", err)
-		}
-		log.Info("V2 migration complete, generating attestation key")
-		if err := generateAttestationKey(); err != nil {
-			log.Fatalf("failed to generate attestation key: %s", err)
-		}
-		runSupervisor(nil) // No migration server for V2
-		return
-	}
-
-	// V1 boot path: decrypt key from KMS and run as supervisor with migration server.
+	// Normal KMS boot: deploy script ensures correct ciphertext + key ID in SSM.
 	if err := waitForSecretKeyFromKMS(context.Background()); err != nil {
 		log.Fatalf("failed to load secret key from KMS: %s", err)
 	}
+
+	// Check if migrated (previous enclave's PCR0 stored in SSM by export handler).
+	if pcr0, err := readMigrationPreviousPCR0(context.Background()); err == nil {
+		PreviousPCR0 = pcr0
+		log.Infof("migrated from previous enclave (pcr0=%s)", pcr0)
+	}
+
+	// If migrated from a locked key, schedule deletion of the old KMS key.
+	deleteOldKMSKey(context.Background())
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -90,35 +70,25 @@ func main() {
 		log.Fatalf("failed to extend PCR16 with pubkey hash: %s", err)
 	}
 
-	// Generate ephemeral attestation key and bind into PCR17.
+	// Generate ephemeral attestation key and bind into userData.
 	if err := generateAttestationKey(); err != nil {
 		log.Fatalf("failed to generate attestation key: %s", err)
 	}
 
-	// Extract raw secret key bytes for the migration server.
-	secretKeyBytes := cfg.SecretKey.Serialize()
-
-	runSupervisor(secretKeyBytes)
+	log.Infof("previous_pcr0=%s", PreviousPCR0)
+	runSupervisor()
 }
 
 // runSupervisor starts the upstream introspector as a child process behind a
-// reverse proxy, and optionally runs the migration vsock server.
-// If secretKey is nil, no migration server is started (V2 mode).
-func runSupervisor(secretKey []byte) {
+// reverse proxy that signs all responses with the attestation key.
+func runSupervisor() {
 	// The upstream introspector listens on an internal port (7074).
 	// Our reverse proxy listens on the configured port (7073) and
-	// adds /v1/migration-status before forwarding to upstream.
+	// adds /v1/enclave-info before forwarding to upstream.
 	upstreamPort := "7074"
 	os.Setenv("INTROSPECTOR_PORT", upstreamPort)
 
-	migrationDone := make(chan struct{})
-
-	// Start migration vsock server (V1 only).
-	if secretKey != nil {
-		go startMigrationServer(secretKey, migrationDone)
-	}
-
-	// Start the reverse proxy that intercepts /v1/migration-status.
+	// Start the reverse proxy.
 	proxyPort := os.Getenv("INTROSPECTOR_PROXY_PORT")
 	if proxyPort == "" {
 		proxyPort = "7073"
@@ -136,7 +106,7 @@ func runSupervisor(secretKey []byte) {
 	}
 	log.Infof("started upstream introspector (PID %d) on port %s", cmd.Process.Pid, upstreamPort)
 
-	// Wait for either: child exit, migration completion, or SIGTERM.
+	// Wait for either: child exit or SIGTERM.
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
@@ -146,11 +116,6 @@ func runSupervisor(secretKey []byte) {
 	}()
 
 	select {
-	case <-migrationDone:
-		log.Info("migration complete, shutting down V1")
-		cmd.Process.Signal(syscall.SIGTERM)
-		cmd.Wait()
-		os.Exit(0)
 	case err := <-cmdDone:
 		if err != nil {
 			log.Fatalf("introspector exited with error: %s", err)
@@ -164,7 +129,7 @@ func runSupervisor(secretKey []byte) {
 }
 
 // startReverseProxy runs an HTTP proxy on proxyPort that:
-// - Handles /v1/migration-status locally
+// - Handles /v1/enclave-info locally
 // - Forwards everything else to the upstream introspector on upstreamPort
 func startReverseProxy(proxyPort, upstreamPort string) {
 	upstream, _ := url.Parse("http://127.0.0.1:" + upstreamPort)
@@ -172,8 +137,9 @@ func startReverseProxy(proxyPort, upstreamPort string) {
 
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("GET /v1/migration-status", handleMigrationStatus)
 	mux.HandleFunc("GET /v1/enclave-info", handleEnclaveInfo)
+	mux.HandleFunc("POST /v1/export-key", handleExportKey)
+	mux.HandleFunc("POST /v1/delete-kms-key", handleDeleteKMSKey)
 
 	// Forward everything else to upstream.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -190,45 +156,15 @@ func startReverseProxy(proxyPort, upstreamPort string) {
 	}
 }
 
-func handleMigrationStatus(w http.ResponseWriter, r *http.Request) {
-	awsCfg, err := loadAWSConfigWithIMDS(r.Context())
-	if err != nil {
-		http.Error(w, fmt.Sprintf("load AWS config: %v", err), http.StatusInternalServerError)
-		return
-	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
-	state, err := loadMigrationState(r.Context(), ssmClient)
-	if err != nil {
-		http.Error(w, fmt.Sprintf("load migration state: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	resp := struct {
-		State           *MigrationState `json:"state"`
-		CooldownExpired bool            `json:"cooldown_expired,omitempty"`
-	}{
-		State: state,
-	}
-	if state != nil && state.CompletedAt == 0 {
-		resp.CooldownExpired = isCooldownExpired(state)
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
-}
-
-// handleEnclaveInfo returns build-time and runtime metadata about this enclave,
-// including the attestation chain, maintainer key, and ephemeral attestation key.
+// handleEnclaveInfo returns build-time and runtime metadata about this enclave.
 func handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
-		Version            string `json:"version"`
-		PreviousPCR0       string `json:"previous_pcr0"`
-		MaintainerPubkey   string `json:"maintainer_pubkey,omitempty"`
-		AttestationPubkey  string `json:"attestation_pubkey,omitempty"`
+		Version           string `json:"version"`
+		PreviousPCR0      string `json:"previous_pcr0"`
+		AttestationPubkey string `json:"attestation_pubkey,omitempty"`
 	}{
-		Version:          Version,
-		PreviousPCR0:     PreviousPCR0,
-		MaintainerPubkey: MaintainerPubkey,
+		Version:      Version,
+		PreviousPCR0: PreviousPCR0,
 	}
 	if attestationKey != nil {
 		resp.AttestationPubkey = hex.EncodeToString(
@@ -236,18 +172,6 @@ func handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
-}
-
-// truncateHex returns the first 16 chars of a hex string with "..." appended,
-// or the original string if shorter. Used for log output.
-func truncateHex(s string) string {
-	if s == "" {
-		return "(empty)"
-	}
-	if len(s) <= 16 {
-		return s
-	}
-	return s[:16] + "..."
 }
 
 // extendPCR16WithPubkey extends PCR16 with SHA256(compressedPubkey) and locks it.
@@ -384,7 +308,7 @@ type responseRecorder struct {
 	status  int
 }
 
-func (r *responseRecorder) Header() http.Header { return r.headers }
+func (r *responseRecorder) Header() http.Header  { return r.headers }
 func (r *responseRecorder) WriteHeader(code int) { r.status = code }
 func (r *responseRecorder) Write(b []byte) (int, error) {
 	return r.body.Write(b)

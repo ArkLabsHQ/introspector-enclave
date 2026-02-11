@@ -14,15 +14,10 @@
         nitro = aws-nitro-util.lib.${system};
 
         # Pass build-time variables via environment when building:
-        #   VERSION=dev AWS_REGION=us-east-1 nix build --impure .#eif
-        #
-        # For migration support, also set:
-        #   PREVIOUS_PCR0=<hex>         PCR0 of the previous enclave (or "genesis")
-        #   MAINTAINER_PUBKEY=<hex>     32-byte x-only Schnorr pubkey for migration auth
+        #   VERSION=dev AWS_REGION=us-east-1 CDK_PREFIX=dev nix build --impure .#eif
         version = let v = builtins.getEnv "VERSION"; in if v == "" then "dev" else v;
         region = let r = builtins.getEnv "AWS_REGION"; in if r == "" then "us-east-1" else r;
-        previousPCR0 = let p = builtins.getEnv "PREVIOUS_PCR0"; in if p == "" then "genesis" else p;
-        maintainerPubkey = builtins.getEnv "MAINTAINER_PUBKEY";
+        deployment = let d = builtins.getEnv "CDK_PREFIX"; in if d == "" then "dev" else d;
 
         # Filter source to only include files relevant to the Go build.
         src = pkgs.lib.cleanSourceWith {
@@ -41,15 +36,12 @@
           pname = "introspector-init";
           inherit version src;
 
-          vendorHash = "sha256-LrWKwvHdY0+k2BEEyETVCFgX0T6r0jB2bM6/G/yg2x0=";
+          vendorHash = "sha256-Su+49otxVLeqvSNCn0SFRpT1tASt5iwklEz29CyxCqE=";
 
           subPackages = [ "." ];
           env.CGO_ENABLED = "0";
           ldflags = [
             "-X" "main.Version=${version}"
-            "-X" "main.PreviousPCR0=${previousPCR0}"
-          ] ++ pkgs.lib.optionals (maintainerPubkey != "") [
-            "-X" "main.MaintainerPubkey=${maintainerPubkey}"
           ];
 
           # Deterministic build flags.
@@ -157,7 +149,7 @@
         enclaveEnv = ''
           PATH=/app:/bin:/usr/bin
           INTROSPECTOR_DATADIR=/app/data
-          INTROSPECTOR_DEPLOYMENT=${version}
+          INTROSPECTOR_DEPLOYMENT=${deployment}
           INTROSPECTOR_AWS_REGION=${region}
           AWS_REGION=${region}
           SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
@@ -178,31 +170,10 @@
           env = enclaveEnv;
         };
 
-        # Docker image (legacy, for comparison with nitro-cli build-enclave).
-        enclave-image = pkgs.dockerTools.buildImage {
-          name = "introspector-enclave";
-          tag = "nix";
-          created = "2024-01-01T00:00:00Z";
-
-          copyToRoot = enclaveRootfs;
-
-          config = {
-            Entrypoint = [ "/app/start.sh" ];
-            WorkingDir = "/app";
-            Env = [
-              "PATH=/app:/bin:/usr/bin"
-              "INTROSPECTOR_DATADIR=/app/data"
-              "INTROSPECTOR_DEPLOYMENT=${version}"
-              "INTROSPECTOR_AWS_REGION=${region}"
-              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-            ];
-          };
-        };
-
       in
       {
         packages = {
-          inherit introspector-init introspector-upstream nitriding viproxy enclave-image eif;
+          inherit introspector-init introspector-upstream nitriding viproxy eif;
           default = eif;
         };
       }

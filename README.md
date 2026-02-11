@@ -98,10 +98,9 @@ The UserData format is: `[0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:
 ```
 .
 ├── enclave/
-│   ├── main.go                    # introspector-init: supervisor + migration + PCR16 binding + attestation key + response signing
+│   ├── main.go                    # introspector-init: supervisor + PCR16 binding + attestation key + response signing
+│   ├── migrate.go                 # Key migration via vsock (transfer between enclave versions)
 │   ├── kms_ssm.go                 # KMS encrypt/decrypt with attestation, SSM storage
-│   ├── migration.go               # Migration state types and SSM operations
-│   ├── migration_server.go        # Vsock HTTP server for V1-V2 migration protocol
 │   ├── config.go                  # Configuration (env vars via viper)
 │   ├── imds.go                    # IMDS credential fetching via viproxy
 │   ├── start.sh                   # Entrypoint (viproxy + nitriding + introspector-init)
@@ -116,8 +115,8 @@ The UserData format is: `[0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:
 │   └── main.go                    # Attestation verification client (PCR0 + PCR16 + appKeyHash + response sigs)
 ├── scripts/
 │   ├── build_eif.sh               # Build EIF reproducibly via Docker + Nix
-│   ├── deploy.sh                  # CDK deploy + KMS policy setup
-│   ├── deploy_v2.sh               # V2 migration deployment
+│   ├── deploy.sh                  # CDK deploy (fresh) or KMS key migration (upgrade, auto-detects locked keys)
+│   ├── migrate.sh                 # Manual key migration for locked KMS keys (debugging)
 │   ├── call.sh                    # Verify attestation + pubkey binding
 │   └── lock_kms_policy.sh         # Irreversible KMS lockdown (PCR0-only decrypt)
 └── cdk.json                       # CDK app entry point
@@ -134,8 +133,7 @@ All endpoints are served behind [nitriding](https://github.com/brave/nitriding-d
 | POST   | `/v1/tx`                   | Submit Ark + checkpoint transactions for signing  |
 | POST   | `/v1/intent`               | Submit a signed intent proof                      |
 | POST   | `/v1/finalization`         | Submit forfeits and commitment for signing        |
-| GET    | `/v1/migration-status`     | Migration state (cooldown, V2 PCR0, completion)   |
-| GET    | `/v1/enclave-info`         | Build + runtime metadata (version, previous PCR0, maintainer, attestation key)|
+| GET    | `/v1/enclave-info`         | Build + runtime metadata (version, previous PCR0, attestation key) |
 
 All responses include `X-Attestation-Signature` (BIP-340 Schnorr over SHA256(body)) and `X-Attestation-Pubkey` (compressed pubkey) headers for per-response authentication.
 
@@ -174,12 +172,24 @@ This builds the EIF reproducibly inside a pinned NixOS Docker container (`nixos/
 ./scripts/deploy.sh
 ```
 
-This script:
+This script auto-detects whether this is a fresh deploy or an upgrade:
 
-- Reads PCR0 from `artifacts/pcr.json` (build step must be run first)
+**Fresh deploy** (no running instance):
 - Deploys the CDK stack (VPC, EC2, KMS key, ECR images, systemd services)
 - Applies a KMS key policy restricting decryption to the enclave's PCR0
 - Waits for the EC2 instance to be ready
+
+**Upgrade with unlocked KMS key** (PutKeyPolicy still allowed):
+- Updates the KMS key policy with the new PCR0
+- Uploads the new EIF to S3, restarts the enclave via SSM Run Command
+
+**Upgrade with locked KMS key** (after `lock_kms_policy.sh`):
+- Creates a new KMS key with a policy allowing the new PCR0 to decrypt
+- Calls the old enclave's `POST /v1/export-key` to re-encrypt the signing key with the new KMS key
+- Copies the migration ciphertext to `SecretKeyCiphertext` and updates `KMSKeyID` in SSM
+- Uploads the new EIF to S3, restarts the enclave via SSM Run Command
+
+No SSH is required -- the deploy script orchestrates everything remotely via SSM.
 
 ### 4. Verify the enclave
 
@@ -197,117 +207,38 @@ This verifies the enclave's attestation document and pubkey binding via PCR16. U
 
 **Warning:** This is irreversible. After locking, no one can modify the key policy or decrypt outside the enclave with the matching PCR0.
 
-## Software Migration
+### PCR0 Attestation Chain
 
-When the KMS key is locked to a specific PCR0, updating the enclave software requires migrating the signing key to a new enclave with a different PCR0. The migration protocol transfers the key trustlessly with a mandatory 24-hour cooldown and optional maintainer authorization.
-
-### Protocol
+Each enclave version records its predecessor's PCR0, creating a verifiable upgrade chain:
 
 ```
-V1 Enclave (PCR0_v1, locked KMS)         V2 Enclave (PCR0_v2, own KMS key)
-────────────────────────────              ────────────────────────────────
-Running, serving API                      Deployed in parallel
-
-T+0:  V2 connects via vsock ──────────────► sends attestation + KMS key ID
-                                            + maintainer signature (if configured)
-      V1 validates attestation ◄──────────
-      V1 verifies maintainer signature
-      V1 records attestation chain in SSM
-      /v1/migration-status shows pending
-
-T+24h: Cooldown expires
-       V2 requests completion ────────────►
-       V1 re-encrypts key under V2 KMS key
-       V1 stores V2 ciphertext in SSM
-       V1 shuts down                       V2 reads ciphertext, decrypts via own KMS
-                                           V2 serves API with same signing pubkey
+Genesis → PCR0_v1 (previous_pcr0=genesis)
+       → PCR0_v2 (previous_pcr0=PCR0_v1)
+       → PCR0_v3 (previous_pcr0=PCR0_v2)
 ```
 
-### Maintainer Key Authorization
+The chain is exposed via `/v1/enclave-info`. During migration, the new enclave fetches the old enclave's PCR0 from its attestation document and records it as `previous_pcr0`. On first boot (no migration), the value is `"genesis"`.
 
-When `MAINTAINER_PUBKEY` is set at build time, migration requires a Schnorr signature from the maintainer key (32-byte x-only pubkey, BIP-340). The signature covers:
+### Key Migration
 
-```
-message = SHA256(target_pcr0_hex + ":" + activation_time_decimal)
-```
+When deploying a new enclave version (different PCR0) after locking the KMS key, the signing key must be migrated. This is handled automatically by `deploy.sh`:
 
-Where `target_pcr0_hex` is the lowercase hex PCR0 of V2 and `activation_time_decimal` is the Unix timestamp for the earliest migration completion (must be >= now + 24h).
-
-The maintainer key can be:
-- A single secp256k1 key
-- A MuSig or FROST aggregate key (for multi-party authorization)
-
-Without `MAINTAINER_PUBKEY`, any V2 enclave deployed on the same host can initiate migration (suitable for development but not production).
-
-### Attestation Chain
-
-Each enclave build embeds `PREVIOUS_PCR0` via `-ldflags`, creating an immutable chain:
-
-```
-Genesis → PCR0_v1 (PREVIOUS_PCR0=genesis)
-       → PCR0_v2 (PREVIOUS_PCR0=PCR0_v1)
-       → PCR0_v3 (PREVIOUS_PCR0=PCR0_v2)
+```sh
+./scripts/build_eif.sh
+./scripts/deploy.sh
 ```
 
-The chain is recorded in migration state and exposed via `/v1/enclave-info`. Clients can verify the full upgrade lineage by checking that each version's `PREVIOUS_PCR0` matches its predecessor.
+The deploy script detects the locked KMS key and uses a **temporary KMS key** to transfer the signing key sequentially (no simultaneous enclaves needed):
 
-### Migration Steps
+1. `deploy.sh` creates a new KMS key with a policy allowing the new PCR0 to decrypt
+2. It generates a one-time migration token and stores it (along with the new key ID) in SSM
+3. It calls the old enclave's `POST /v1/export-key` endpoint, which encrypts the signing key with the new KMS key and stores the ciphertext in SSM
+4. `deploy.sh` copies the migration ciphertext to `SecretKeyCiphertext`, updates `KMSKeyID` to the new key
+5. It stops the old enclave, uploads the new EIF, and restarts — the new enclave boots normally using the new KMS key
 
-1. **Update the code** and rebuild the EIF:
-   ```sh
-   PREVIOUS_PCR0=<current_pcr0> MAINTAINER_PUBKEY=<hex> ./scripts/build_eif.sh
-   ```
+The export endpoint is authenticated with a bearer token and responds exactly once (`sync.Once`). Each enclave version gets its own KMS key. On boot, the new enclave automatically schedules deletion of the old locked KMS key (7-day pending window).
 
-2. **Re-deploy the CDK stack** (adds V2 KMS key and migration SSM parameters):
-   ```sh
-   ./scripts/deploy.sh
-   ```
-
-3. **Sign the migration** (if maintainer key is configured):
-   ```sh
-   # Sign: SHA256("<v2_pcr0>:<activation_timestamp>")
-   # Store signature and activation time:
-   export MAINTAINER_SIG=<schnorr_sig_hex>
-   export MIGRATION_ACTIVATION_TIME=<unix_timestamp>
-   ```
-
-4. **Deploy V2** alongside the running V1 enclave:
-   ```sh
-   ./scripts/deploy_v2.sh
-   ```
-
-5. **Monitor migration** status (24h cooldown):
-   ```sh
-   cd client && go run . --base-url https://<host> --insecure --check-migration
-   ```
-
-6. After 24h (or the maintainer-specified activation time), V2 completes the migration and V1 shuts down.
-
-7. **(Optional) Lock the V2 KMS key:**
-   ```sh
-   ./scripts/lock_kms_policy.sh  # with V2 PCR0 in artifacts/pcr.json
-   ```
-
-### Architecture
-
-The init binary runs as a **supervisor** rather than exec'ing the upstream binary:
-
-- Starts the upstream introspector as a child process on port 7074
-- Runs a reverse proxy on port 7073 that adds `/v1/migration-status` and `/v1/enclave-info`
-- Hosts a **vsock migration server** on port 9999 for V1-V2 communication
-- On migration completion, signals the child process to shut down
-
-V2 is detected by the `INTROSPECTOR_V1_CID` environment variable. When set, the init binary connects to V1's migration server instead of loading the key from KMS.
-
-### Migration SSM Parameters
-
-| Parameter | Description |
-|-----------|-------------|
-| `/<deployment>/NitroIntrospector/MigrationState` | JSON migration state (target PCR0, chain, timestamps) |
-| `/<deployment>/NitroIntrospector/V2SecretKeyCiphertext` | V2-encrypted signing key ciphertext |
-| `/<deployment>/NitroIntrospector/V2KMSKeyID` | KMS key ID for V2 enclave |
-| `/<deployment>/NitroIntrospector/MaintainerSig` | Schnorr signature for migration authorization |
-| `/<deployment>/NitroIntrospector/MigrationActivationTime` | Maintainer-specified activation timestamp |
+For manual migration (debugging), `scripts/migrate.sh` can be run from the deployer's machine.
 
 ## Reproducible Build
 
@@ -317,7 +248,7 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 
 | Package                | Description                                    |
 |------------------------|------------------------------------------------|
-| `introspector-init`    | KMS decrypt + PCR16 binding + supervisor + migration |
+| `introspector-init`    | KMS decrypt + PCR16 binding + attestation key + supervisor |
 | `introspector-upstream`| Upstream signing service (pinned commit)       |
 | `nitriding`            | TLS termination + attestation daemon           |
 | `viproxy`              | IMDS forwarding for enclave                    |
@@ -336,7 +267,7 @@ Build the enclave EIF image and output its PCR values:
 ./scripts/build_eif.sh
 ```
 
-Override defaults with environment variables: `VERSION`, `AWS_REGION`, `PREVIOUS_PCR0`, `MAINTAINER_PUBKEY`.
+Override defaults with environment variables: `VERSION`, `AWS_REGION`.
 
 ### Verify a running enclave
 
@@ -389,7 +320,6 @@ All configuration is via environment variables prefixed with `INTROSPECTOR_`:
 | `INTROSPECTOR_KMS_KEY_ID`                  | KMS key ID override                    | (auto)     |
 | `INTROSPECTOR_NITRIDING_INT_PORT`          | Nitriding internal port                | `8080`     |
 | `INTROSPECTOR_AWS_REGION`                  | AWS region for KMS/SSM                 | `us-east-1`|
-| `INTROSPECTOR_V1_CID`                     | V1 enclave vsock CID (V2 migration mode) | (unset)  |
 | `INTROSPECTOR_PROXY_PORT`                 | Reverse proxy listen port              | `7073`     |
 
 ## Watchdog

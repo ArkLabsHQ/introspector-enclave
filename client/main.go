@@ -55,7 +55,6 @@ func main() {
 	buildRegion := flag.String("build-region", "", "AWS_REGION for nix build (used with --verify-build)")
 	verifyPubkey := flag.Bool("verify-pubkey", true, "Verify that /v1/info pubkey matches attestation PCR16 hash")
 	verifyAttestationKey := flag.Bool("verify-attestation-key", true, "Verify attestation key via UserData appKeyHash and test response signature")
-	checkMigration := flag.Bool("check-migration", false, "Check migration status from /v1/migration-status")
 	flag.Parse()
 
 	if *baseURL == "" {
@@ -97,13 +96,6 @@ func main() {
 	if *verifyAttestationKey {
 		if err := verifyAttestationKeyBinding(client, *baseURL, attestResult); err != nil {
 			fmt.Fprintf(os.Stderr, "attestation key verification failed: %v\n", err)
-			os.Exit(1)
-		}
-	}
-
-	if *checkMigration {
-		if err := checkMigrationStatus(client, *baseURL); err != nil {
-			fmt.Fprintf(os.Stderr, "migration status check failed: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -477,104 +469,10 @@ func verifyResponseSignature(client *http.Client, baseURL, attestPubkeyHex strin
 	return nil
 }
 
-type migrationStatusResponse struct {
-	State *struct {
-		TargetPCR0     string `json:"target_pcr0"`
-		V2KMSKeyID     string `json:"v2_kms_key_id"`
-		InitiatedAt    int64  `json:"initiated_at"`
-		CompletedAt    int64  `json:"completed_at,omitempty"`
-		SourcePCR0     string `json:"source_pcr0,omitempty"`
-		PreviousPCR0   string `json:"previous_pcr0,omitempty"`
-		ActivationTime int64  `json:"activation_time,omitempty"`
-	} `json:"state"`
-	CooldownExpired bool `json:"cooldown_expired,omitempty"`
-}
-
 type enclaveInfoResponse struct {
 	Version           string `json:"version"`
 	PreviousPCR0      string `json:"previous_pcr0"`
-	MaintainerPubkey  string `json:"maintainer_pubkey,omitempty"`
 	AttestationPubkey string `json:"attestation_pubkey,omitempty"`
-}
-
-func checkMigrationStatus(client *http.Client, baseURL string) error {
-	// Fetch enclave info (attestation chain metadata).
-	if info, err := fetchEnclaveInfo(client, baseURL); err == nil {
-		fmt.Printf("enclave info:\n")
-		fmt.Printf("  version:           %s\n", info.Version)
-		fmt.Printf("  previous PCR0:     %s\n", info.PreviousPCR0)
-		if info.MaintainerPubkey != "" {
-			fmt.Printf("  maintainer pubkey: %s\n", info.MaintainerPubkey)
-		} else {
-			fmt.Printf("  maintainer pubkey: (not configured)\n")
-		}
-		if info.AttestationPubkey != "" {
-			fmt.Printf("  attestation key:   %s\n", info.AttestationPubkey)
-		}
-		fmt.Println()
-	} else {
-		fmt.Fprintf(os.Stderr, "warning: could not fetch /v1/enclave-info: %v\n", err)
-	}
-
-	// Fetch migration status.
-	statusURL := strings.TrimRight(baseURL, "/") + "/v1/migration-status"
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, statusURL, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("migration-status status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var status migrationStatusResponse
-	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		return fmt.Errorf("decode migration status: %w", err)
-	}
-
-	if status.State == nil {
-		fmt.Println("migration status: no migration pending")
-		return nil
-	}
-
-	initiated := time.Unix(status.State.InitiatedAt, 0)
-	fmt.Printf("migration status:\n")
-	fmt.Printf("  target PCR0:     %s\n", status.State.TargetPCR0)
-	fmt.Printf("  V2 KMS key:      %s\n", status.State.V2KMSKeyID)
-	fmt.Printf("  initiated at:    %s\n", initiated.Format(time.RFC3339))
-
-	// Attestation chain info from migration state.
-	if status.State.SourcePCR0 != "" {
-		fmt.Printf("  source PCR0:     %s\n", status.State.SourcePCR0)
-	}
-	if status.State.PreviousPCR0 != "" {
-		fmt.Printf("  chain prev PCR0: %s\n", status.State.PreviousPCR0)
-	}
-	if status.State.ActivationTime != 0 {
-		fmt.Printf("  activation time: %s\n", time.Unix(status.State.ActivationTime, 0).Format(time.RFC3339))
-	}
-
-	if status.State.CompletedAt != 0 {
-		completed := time.Unix(status.State.CompletedAt, 0)
-		fmt.Printf("  completed at:    %s\n", completed.Format(time.RFC3339))
-		fmt.Println("  status:          COMPLETED")
-	} else if status.CooldownExpired {
-		fmt.Println("  cooldown:        EXPIRED (ready for completion)")
-	} else {
-		cooldownEnd := initiated.Add(24 * time.Hour)
-		remaining := time.Until(cooldownEnd)
-		fmt.Printf("  cooldown until:  %s (%s remaining)\n", cooldownEnd.Format(time.RFC3339), remaining.Round(time.Second))
-		fmt.Println("  status:          PENDING")
-	}
-
-	return nil
 }
 
 func fetchEnclaveInfo(client *http.Client, baseURL string) (*enclaveInfoResponse, error) {
