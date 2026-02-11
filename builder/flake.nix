@@ -13,10 +13,11 @@
         pkgs = import nixpkgs { inherit system; };
         nitro = aws-nitro-util.lib.${system};
 
-        # Pass VERSION and AWS_REGION via environment when building:
-        #   VERSION=dev AWS_REGION=us-east-1 nix build --impure .#eif
+        # Pass build-time variables via environment when building:
+        #   VERSION=dev AWS_REGION=us-east-1 CDK_PREFIX=dev nix build --impure .#eif
         version = let v = builtins.getEnv "VERSION"; in if v == "" then "dev" else v;
         region = let r = builtins.getEnv "AWS_REGION"; in if r == "" then "us-east-1" else r;
+        deployment = let d = builtins.getEnv "CDK_PREFIX"; in if d == "" then "dev" else d;
 
         # Filter source to only include files relevant to the Go build.
         src = pkgs.lib.cleanSourceWith {
@@ -35,11 +36,13 @@
           pname = "introspector-init";
           inherit version src;
 
-          vendorHash = "sha256-50QaMGcKse0dm6BtG/3q1V9GUQmm4GqRARXewvNSfiw=";
+          vendorHash = "sha256-Su+49otxVLeqvSNCn0SFRpT1tASt5iwklEz29CyxCqE=";
 
           subPackages = [ "." ];
           env.CGO_ENABLED = "0";
-          ldflags = [ "-X" "main.Version=${version}" ];
+          ldflags = [
+            "-X" "main.Version=${version}"
+          ];
 
           # Deterministic build flags.
           buildFlags = [ "-trimpath" ];
@@ -146,7 +149,7 @@
         enclaveEnv = ''
           PATH=/app:/bin:/usr/bin
           INTROSPECTOR_DATADIR=/app/data
-          INTROSPECTOR_DEPLOYMENT=${version}
+          INTROSPECTOR_DEPLOYMENT=${deployment}
           INTROSPECTOR_AWS_REGION=${region}
           AWS_REGION=${region}
           SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
@@ -167,31 +170,10 @@
           env = enclaveEnv;
         };
 
-        # Docker image (legacy, for comparison with nitro-cli build-enclave).
-        enclave-image = pkgs.dockerTools.buildImage {
-          name = "introspector-enclave";
-          tag = "nix";
-          created = "2024-01-01T00:00:00Z";
-
-          copyToRoot = enclaveRootfs;
-
-          config = {
-            Entrypoint = [ "/app/start.sh" ];
-            WorkingDir = "/app";
-            Env = [
-              "PATH=/app:/bin:/usr/bin"
-              "INTROSPECTOR_DATADIR=/app/data"
-              "INTROSPECTOR_DEPLOYMENT=${version}"
-              "INTROSPECTOR_AWS_REGION=${region}"
-              "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
-            ];
-          };
-        };
-
       in
       {
         packages = {
-          inherit introspector-init introspector-upstream nitriding viproxy enclave-image eif;
+          inherit introspector-init introspector-upstream nitriding viproxy eif;
           default = eif;
         };
       }

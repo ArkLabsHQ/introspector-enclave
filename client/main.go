@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/hf/nitrite"
 )
 
@@ -53,6 +54,7 @@ func main() {
 	buildVersion := flag.String("build-version", "", "VERSION for nix build (used with --verify-build)")
 	buildRegion := flag.String("build-region", "", "AWS_REGION for nix build (used with --verify-build)")
 	verifyPubkey := flag.Bool("verify-pubkey", true, "Verify that /v1/info pubkey matches attestation PCR16 hash")
+	verifyAttestationKey := flag.Bool("verify-attestation-key", true, "Verify attestation key via UserData appKeyHash and test response signature")
 	flag.Parse()
 
 	if *baseURL == "" {
@@ -87,6 +89,13 @@ func main() {
 	if *verifyPubkey {
 		if err := verifyPubkeyBinding(client, *baseURL, attestResult); err != nil {
 			fmt.Fprintf(os.Stderr, "pubkey binding verification failed: %v\n", err)
+			os.Exit(1)
+		}
+	}
+
+	if *verifyAttestationKey {
+		if err := verifyAttestationKeyBinding(client, *baseURL, attestResult); err != nil {
+			fmt.Fprintf(os.Stderr, "attestation key verification failed: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -331,6 +340,164 @@ func verifyPubkeyBinding(client *http.Client, baseURL string, attestResult *nitr
 
 	fmt.Printf("pubkey binding verified via PCR16: %s attested in enclave\n", info.SignerPubkey)
 	return nil
+}
+
+// verifyAttestationKeyBinding verifies the enclave's ephemeral attestation key
+// by checking that the pubkey from /v1/enclave-info matches the appKeyHash in
+// the attestation document's UserData, then verifying a live response signature.
+//
+// UserData format (nitriding): [0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:32]
+// Total 68 bytes. appKeyHash is at bytes 36:68 (after the 2nd multihash prefix).
+func verifyAttestationKeyBinding(client *http.Client, baseURL string, attestResult *nitrite.Result) error {
+	if attestResult == nil || attestResult.Document == nil {
+		return fmt.Errorf("no attestation result to verify against")
+	}
+
+	userData := attestResult.Document.UserData
+	if len(userData) < 68 {
+		fmt.Println("attestation key: UserData too short for appKeyHash (enclave may not support attestation key)")
+		return nil
+	}
+
+	// Extract appKeyHash from UserData at offset 36 (after 2nd multihash prefix 0x12, 0x20).
+	if userData[34] != 0x12 || userData[35] != 0x20 {
+		return fmt.Errorf("UserData missing multihash prefix at offset 34 (got %02x %02x)", userData[34], userData[35])
+	}
+	appKeyHash := userData[36:68]
+
+	// Check if appKeyHash is all zeros (no attestation key registered).
+	allZero := true
+	for _, b := range appKeyHash {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		fmt.Println("attestation key: appKeyHash is all zeros (attestation key not registered)")
+		return nil
+	}
+
+	// Fetch enclave info to get the attestation pubkey.
+	info, err := fetchEnclaveInfo(client, baseURL)
+	if err != nil {
+		return fmt.Errorf("fetch enclave info: %w", err)
+	}
+	if info.AttestationPubkey == "" {
+		return fmt.Errorf("enclave reports no attestation pubkey but appKeyHash is set")
+	}
+
+	attestPubkeyBytes, err := hex.DecodeString(info.AttestationPubkey)
+	if err != nil {
+		return fmt.Errorf("decode attestation pubkey hex: %w", err)
+	}
+
+	// Verify: SHA256(attestation_pubkey) == appKeyHash from UserData
+	expectedHash := sha256.Sum256(attestPubkeyBytes)
+	if !bytes.Equal(expectedHash[:], appKeyHash) {
+		return fmt.Errorf("appKeyHash mismatch: expected SHA256(%s) = %s, got %s",
+			info.AttestationPubkey,
+			hex.EncodeToString(expectedHash[:]),
+			hex.EncodeToString(appKeyHash))
+	}
+
+	fmt.Printf("attestation key binding verified via appKeyHash: %s\n", info.AttestationPubkey)
+
+	// Verify a live response signature from /v1/enclave-info.
+	if err := verifyResponseSignature(client, baseURL, info.AttestationPubkey); err != nil {
+		return fmt.Errorf("response signature verification: %w", err)
+	}
+
+	return nil
+}
+
+// verifyResponseSignature fetches /v1/enclave-info and verifies the
+// X-Attestation-Signature header against the attestation pubkey.
+func verifyResponseSignature(client *http.Client, baseURL, attestPubkeyHex string) error {
+	infoURL := strings.TrimRight(baseURL, "/") + "/v1/enclave-info"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, infoURL, nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
+	}
+
+	sigHex := resp.Header.Get("X-Attestation-Signature")
+	if sigHex == "" {
+		return fmt.Errorf("response missing X-Attestation-Signature header")
+	}
+
+	// Parse the x-only pubkey for Schnorr verification.
+	pubkeyBytes, err := hex.DecodeString(attestPubkeyHex)
+	if err != nil {
+		return fmt.Errorf("decode pubkey: %w", err)
+	}
+	// The attestation pubkey is compressed (33 bytes). Extract x-only (32 bytes)
+	// by dropping the prefix byte.
+	if len(pubkeyBytes) == 33 {
+		pubkeyBytes = pubkeyBytes[1:]
+	}
+	pubkey, err := schnorr.ParsePubKey(pubkeyBytes)
+	if err != nil {
+		return fmt.Errorf("parse attestation pubkey: %w", err)
+	}
+
+	sigBytes, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return fmt.Errorf("decode signature hex: %w", err)
+	}
+	sig, err := schnorr.ParseSignature(sigBytes)
+	if err != nil {
+		return fmt.Errorf("parse signature: %w", err)
+	}
+
+	msgHash := sha256.Sum256(body)
+	if !sig.Verify(msgHash[:], pubkey) {
+		return fmt.Errorf("signature verification failed")
+	}
+
+	fmt.Println("response signature verified (X-Attestation-Signature valid)")
+	return nil
+}
+
+type enclaveInfoResponse struct {
+	Version           string `json:"version"`
+	PreviousPCR0      string `json:"previous_pcr0"`
+	AttestationPubkey string `json:"attestation_pubkey,omitempty"`
+}
+
+func fetchEnclaveInfo(client *http.Client, baseURL string) (*enclaveInfoResponse, error) {
+	infoURL := strings.TrimRight(baseURL, "/") + "/v1/enclave-info"
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, infoURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var info enclaveInfoResponse
+	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
+		return nil, fmt.Errorf("decode enclave info: %w", err)
+	}
+	return &info, nil
 }
 
 // func submitTx(client *http.Client, baseURL, arkTx, checkpointTx string) error {

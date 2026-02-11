@@ -15,19 +15,21 @@ EC2 Instance (m6i.xlarge, Amazon Linux 2023)     |
   v                                       192.168.127.1
 Nitro Enclave ---------------------------------->+
   ├── nitriding             (TLS termination + attestation)
-  ├── introspector-init     (KMS decrypt + PCR16 pubkey binding + exec)
-  ├── introspector          (upstream signing service, port 7073)
+  ├── introspector-init     (KMS decrypt + PCR16 binding + attestation key + supervisor)
+  ├── introspector          (upstream signing service, port 7074)
   └── viproxy               (IMDS forwarding -> vsock CID 3:8002)
 ```
 
 ### Boot Sequence
 
 1. **nitriding** starts and sets up the TAP network interface via gvproxy
-2. **introspector-init** runs as the app command:
+2. **introspector-init** runs as the app command (supervisor mode):
    - Decrypts the signing key from KMS using a Nitro attestation document (PCR0-bound)
    - Derives the compressed public key and extends PCR16 with `SHA256(compressedPubkey)`, then locks it
-   - `syscall.Exec`s the real **introspector** binary, replacing itself
-3. **introspector** (upstream) starts serving the full gRPC + HTTP signing API on port 7073, reading `INTROSPECTOR_SECRET_KEY` from the environment
+   - Generates an ephemeral attestation key and registers `SHA256(attestationPubkey)` with nitriding via `POST /enclave/hash` (embedded as `appKeyHash` in attestation UserData)
+   - Starts the upstream **introspector** as a child process on port 7074
+   - Runs a reverse proxy on port 7073 that signs all responses with the attestation key
+3. **introspector** (upstream) serves the full gRPC + HTTP signing API on port 7074, reading `INTROSPECTOR_SECRET_KEY` from the environment
 
 ### Networking
 
@@ -76,12 +78,28 @@ The signing public key is cryptographically bound to the enclave's attestation d
 
 This ensures the pubkey returned by the API genuinely belongs to the attested enclave, using a first-class PCR value rather than application-level UserData.
 
+### Ephemeral Attestation Key (appKeyHash)
+
+Each enclave boot generates a fresh secp256k1 keypair (the "attestation key") for signing API responses. This provides per-response authentication independent of TLS:
+
+1. A random 32-byte private key is generated at boot using `crypto/rand`
+2. `SHA256(compressedAttestationPubkey)` is registered with nitriding via `POST /enclave/hash`, which embeds it as `appKeyHash` in the attestation document's UserData
+3. Every HTTP response from the reverse proxy includes:
+   - `X-Attestation-Signature`: BIP-340 Schnorr signature over `SHA256(response_body)`
+   - `X-Attestation-Pubkey`: compressed public key of the attestation key
+4. Clients verify the signature, then confirm the pubkey hash matches the `appKeyHash` in the attestation document's UserData
+
+The attestation key uses nitriding's built-in `appKeyHash` mechanism rather than a PCR register. This is compatible with nitriding's horizontal scaling (leader-worker key sync), where the leader generates the attestation key and distributes it to workers via `PUT/GET /enclave/state`. All instances in a fleet share the same attestation key and produce identical attestation documents.
+
+The UserData format is: `[0x12, 0x20, tlsKeyHash:32] ++ [0x12, 0x20, appKeyHash:32]` (68 bytes, multihash-prefixed SHA-256 hashes). The `appKeyHash` is at bytes 36-68.
+
 ## Project Structure
 
 ```
 .
 ├── enclave/
-│   ├── main.go                    # introspector-init: KMS decrypt + PCR16 pubkey binding + exec
+│   ├── main.go                    # introspector-init: supervisor + PCR16 binding + attestation key + response signing
+│   ├── migrate.go                 # Key migration via vsock (transfer between enclave versions)
 │   ├── kms_ssm.go                 # KMS encrypt/decrypt with attestation, SSM storage
 │   ├── config.go                  # Configuration (env vars via viper)
 │   ├── imds.go                    # IMDS credential fetching via viproxy
@@ -94,10 +112,11 @@ This ensures the pubkey returned by the API genuinely belongs to the attested en
 │   ├── flake.nix                  # Nix flake: reproducible EIF build
 │   └── main.go                    # AWS CDK infrastructure (VPC, EC2, KMS, IAM)
 ├── client/
-│   └── main.go                    # Attestation verification client (PCR0 + PCR16)
+│   └── main.go                    # Attestation verification client (PCR0 + PCR16 + appKeyHash + response sigs)
 ├── scripts/
 │   ├── build_eif.sh               # Build EIF reproducibly via Docker + Nix
-│   ├── deploy.sh                  # CDK deploy + KMS policy setup
+│   ├── deploy.sh                  # CDK deploy (fresh) or KMS key migration (upgrade, auto-detects locked keys)
+│   ├── migrate.sh                 # Manual key migration for locked KMS keys (debugging)
 │   ├── call.sh                    # Verify attestation + pubkey binding
 │   └── lock_kms_policy.sh         # Irreversible KMS lockdown (PCR0-only decrypt)
 └── cdk.json                       # CDK app entry point
@@ -114,6 +133,9 @@ All endpoints are served behind [nitriding](https://github.com/brave/nitriding-d
 | POST   | `/v1/tx`                   | Submit Ark + checkpoint transactions for signing  |
 | POST   | `/v1/intent`               | Submit a signed intent proof                      |
 | POST   | `/v1/finalization`         | Submit forfeits and commitment for signing        |
+| GET    | `/v1/enclave-info`         | Build + runtime metadata (version, previous PCR0, attestation key) |
+
+All responses include `X-Attestation-Signature` (BIP-340 Schnorr over SHA256(body)) and `X-Attestation-Pubkey` (compressed pubkey) headers for per-response authentication.
 
 Request and response schemas are defined in `api-spec/protobuf/introspector/v1/service.proto`.
 
@@ -150,12 +172,24 @@ This builds the EIF reproducibly inside a pinned NixOS Docker container (`nixos/
 ./scripts/deploy.sh
 ```
 
-This script:
+This script auto-detects whether this is a fresh deploy or an upgrade:
 
-- Reads PCR0 from `artifacts/pcr.json` (build step must be run first)
+**Fresh deploy** (no running instance):
 - Deploys the CDK stack (VPC, EC2, KMS key, ECR images, systemd services)
 - Applies a KMS key policy restricting decryption to the enclave's PCR0
 - Waits for the EC2 instance to be ready
+
+**Upgrade with unlocked KMS key** (PutKeyPolicy still allowed):
+- Updates the KMS key policy with the new PCR0
+- Uploads the new EIF to S3, restarts the enclave via SSM Run Command
+
+**Upgrade with locked KMS key** (after `lock_kms_policy.sh`):
+- Creates a new KMS key with a policy allowing the new PCR0 to decrypt
+- Calls the old enclave's `POST /v1/export-key` to re-encrypt the signing key with the new KMS key
+- Copies the migration ciphertext to `SecretKeyCiphertext` and updates `KMSKeyID` in SSM
+- Uploads the new EIF to S3, restarts the enclave via SSM Run Command
+
+No SSH is required -- the deploy script orchestrates everything remotely via SSM.
 
 ### 4. Verify the enclave
 
@@ -173,6 +207,39 @@ This verifies the enclave's attestation document and pubkey binding via PCR16. T
 
 **Warning:** This is irreversible. After locking, no one can modify the key policy or decrypt outside the enclave with the matching PCR0.
 
+### PCR0 Attestation Chain
+
+Each enclave version records its predecessor's PCR0, creating a verifiable upgrade chain:
+
+```
+Genesis → PCR0_v1 (previous_pcr0=genesis)
+       → PCR0_v2 (previous_pcr0=PCR0_v1)
+       → PCR0_v3 (previous_pcr0=PCR0_v2)
+```
+
+The chain is exposed via `/v1/enclave-info`. During migration, the new enclave fetches the old enclave's PCR0 from its attestation document and records it as `previous_pcr0`. On first boot (no migration), the value is `"genesis"`.
+
+### Key Migration
+
+When deploying a new enclave version (different PCR0) after locking the KMS key, the signing key must be migrated. This is handled automatically by `deploy.sh`:
+
+```sh
+./scripts/build_eif.sh
+./scripts/deploy.sh
+```
+
+The deploy script detects the locked KMS key and uses a **temporary KMS key** to transfer the signing key sequentially (no simultaneous enclaves needed):
+
+1. `deploy.sh` creates a new KMS key with a policy allowing the new PCR0 to decrypt
+2. It generates a one-time migration token and stores it (along with the new key ID) in SSM
+3. It calls the old enclave's `POST /v1/export-key` endpoint, which encrypts the signing key with the new KMS key and stores the ciphertext in SSM
+4. `deploy.sh` copies the migration ciphertext to `SecretKeyCiphertext`, updates `KMSKeyID` to the new key
+5. It stops the old enclave, uploads the new EIF, and restarts — the new enclave boots normally using the new KMS key
+
+The export endpoint is authenticated with a bearer token and responds exactly once (`sync.Once`). Each enclave version gets its own KMS key. On boot, the new enclave automatically schedules deletion of the old locked KMS key (7-day pending window).
+
+For manual migration (debugging), `scripts/migrate.sh` can be run from the deployer's machine.
+
 ## Reproducible Build
 
 The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/aws-nitro-util](https://github.com/monzo/aws-nitro-util) inside a pinned Docker container, producing a byte-identical EIF on every build. This guarantees identical PCR0 measurements across builds, enabling anyone to verify that the running enclave matches the published source code.
@@ -181,11 +248,30 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 
 | Package                | Description                                    |
 |------------------------|------------------------------------------------|
-| `introspector-init`    | KMS decrypt + PCR16 pubkey binding + exec      |
+| `introspector-init`    | KMS decrypt + PCR16 binding + attestation key + supervisor |
 | `introspector-upstream`| Upstream signing service (pinned commit)       |
 | `nitriding`            | TLS termination + attestation daemon           |
 | `viproxy`              | IMDS forwarding for enclave                    |
 | `eif`                  | Complete enclave image (default)               |
+<<<<<<< HEAD
+Use `-insecure` to skip TLS verification during development.
+
+## Reproducible Build Verification
+
+The enclave image is built with [Nix](https://nixos.org/) using `dockerTools.buildImage`, which produces a byte-identical Docker image on every build. This eliminates non-determinism from Docker layer ordering and guarantees identical PCR0 measurements.
+
+### Build the EIF (reproducible, via Docker)
+
+Build the enclave EIF image and output its PCR values:
+
+```sh
+./scripts/build_eif.sh
+```
+
+Override defaults with environment variables: `VERSION`, `AWS_REGION`.
+
+=======
+>>>>>>> origin/master
 ### Verify a running enclave
 
 The client can build the EIF locally via Docker and compare PCR0 against the running enclave's attestation:
@@ -214,8 +300,14 @@ The client:
 1. Fetches the attestation document with a random nonce
 2. Verifies the attestation signature and PCR0
 3. Fetches `/v1/info` and verifies `SHA384(zeros_48 || SHA256(pubkey))` matches attestation `PCRs[16]`
+4. Fetches `/v1/enclave-info` and verifies `SHA256(attestationPubkey)` matches the `appKeyHash` in the attestation document's UserData
+5. Verifies the `X-Attestation-Signature` header on the response against the attestation key
 
+<<<<<<< HEAD
+Use `--insecure` to skip TLS verification (trust comes from attestation). Use `--verify-pubkey=false` to skip step 3. Use `--verify-attestation-key=false` to skip steps 4-5.
+=======
 TLS certificate verification is skipped by default (trust comes from attestation). Use `--strict-tls` to require a CA-signed certificate. Use `--verify-pubkey=false` to skip step 3.
+>>>>>>> origin/master
 
 ## Configuration
 
@@ -233,6 +325,7 @@ All configuration is via environment variables prefixed with `INTROSPECTOR_`:
 | `INTROSPECTOR_KMS_KEY_ID`                  | KMS key ID override                    | (auto)     |
 | `INTROSPECTOR_NITRIDING_INT_PORT`          | Nitriding internal port                | `8080`     |
 | `INTROSPECTOR_AWS_REGION`                  | AWS region for KMS/SSM                 | `us-east-1`|
+| `INTROSPECTOR_PROXY_PORT`                 | Reverse proxy listen port              | `7073`     |
 
 ## Watchdog
 

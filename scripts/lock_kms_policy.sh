@@ -5,11 +5,11 @@
 #   - No IAM principal (including root) can call kms:Decrypt without attestation
 #   - No IAM principal can modify the key policy (kms:PutKeyPolicy)
 #   - No IAM principal can create grants to bypass the policy
-#   - No IAM principal can delete the key
+#   - The EC2 role can schedule key deletion (for cleanup after migration)
 #
 # THIS IS NOT REVERSIBLE.  The key becomes permanently bound to the given PCR0.
-# To rotate to new enclave code, use scripts/migrate_key.sh BEFORE locking the
-# new key.
+# To upgrade enclave code later, run ./scripts/deploy.sh — it automatically
+# detects the locked key and creates a new KMS key for the new enclave version.
 #
 # Usage:
 #   ./scripts/lock_kms_policy.sh [cdk-outputs.json]
@@ -76,8 +76,8 @@ echo ""
 echo "  After this, the key policy CANNOT be modified by anyone."
 echo "  Only an enclave with PCR0=${pcr0:0:16}... can decrypt."
 echo ""
-echo "  To update enclave code later, you MUST use migrate_key.sh"
-echo "  BEFORE running this script on the new KMS key."
+echo "  To update enclave code later, just run ./scripts/deploy.sh"
+echo "  It will detect the lock and create a new KMS key automatically."
 echo ""
 read -r -p "  Type 'LOCK' to proceed: " confirmation
 
@@ -107,6 +107,13 @@ policy=$(cat <<EOF
       "Effect": "Allow",
       "Principal": {"AWS": "${ec2_role_arn}"},
       "Action": "kms:Encrypt",
+      "Resource": "*"
+    },
+    {
+      "Sid": "AllowKeyDeletion",
+      "Effect": "Allow",
+      "Principal": {"AWS": "${ec2_role_arn}"},
+      "Action": "kms:ScheduleKeyDeletion",
       "Resource": "*"
     }
   ]

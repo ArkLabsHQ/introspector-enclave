@@ -106,6 +106,31 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/SecretKeyCiphertext", deployment)),
 	})
 
+	migrationTokenParam := awsssm.NewStringParameter(stack, jsii.String("MigrationToken"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationToken", deployment)),
+	})
+
+	migrationKMSKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("MigrationKMSKeyID"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationKMSKeyID", deployment)),
+	})
+
+	migrationCiphertextParam := awsssm.NewStringParameter(stack, jsii.String("MigrationCiphertext"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationCiphertext", deployment)),
+	})
+
+	migrationPreviousPCR0Param := awsssm.NewStringParameter(stack, jsii.String("MigrationPreviousPCR0"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationPreviousPCR0", deployment)),
+	})
+
+	migrationOldKMSKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("MigrationOldKMSKeyID"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationOldKMSKeyID", deployment)),
+	})
+
 	vpc := awsec2.NewVpc(stack, jsii.String("VPC"), &awsec2.VpcProps{
 		NatGateways: jsii.Number(1),
 		SubnetConfiguration: &[]*awsec2.SubnetConfiguration{
@@ -195,6 +220,14 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	gvproxySystemd.GrantRead(role)
 	secretCiphertextParam.GrantRead(role)
 	secretCiphertextParam.GrantWrite(role)
+	migrationTokenParam.GrantRead(role)
+	migrationKMSKeyIDParam.GrantRead(role)
+	migrationCiphertextParam.GrantRead(role)
+	migrationCiphertextParam.GrantWrite(role)
+	migrationPreviousPCR0Param.GrantRead(role)
+	migrationPreviousPCR0Param.GrantWrite(role)
+	migrationOldKMSKeyIDParam.GrantRead(role)
+	migrationOldKMSKeyIDParam.GrantWrite(role)
 
 	blockDevice := awsec2.BlockDevice{
 		DeviceName: jsii.String("/dev/xvda"),

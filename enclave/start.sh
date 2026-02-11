@@ -14,6 +14,9 @@ fi
 
 export INTROSPECTOR_NO_TLS=true
 
+# Migration mode: introspector-init reads the MigrationCID SSM parameter
+# at boot. If set, it obtains the signing key from the old enclave via vsock.
+
 # The AWS SDK needs a region. Inside the enclave, IMDS region detection
 # may fail, so we set it explicitly from the deployment config.
 if [ -z "${AWS_DEFAULT_REGION:-}" ]; then
