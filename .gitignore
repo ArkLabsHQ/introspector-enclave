@@ -13,9 +13,19 @@ enclave-image.tar.gz
 # CDK outputs
 cdk-outputs.json
 
+# Generated build config (from enclave.yaml for Nix)
+build-config.json
+
+# Enclave CLI config (contains account IDs)
+enclave.yaml
+
+# CLI binary
+enclave
+
 # Built binaries
 introspector
 introspector-client
+./bin/ 
 *.eif
 
 # Temporary build artifacts
@@ -23,3 +33,9 @@ introspector-client
 
 # Go vendor directory
 vendor/
+
+# Example folder (not used in production) /examples/
+example/
+
+bin/
+

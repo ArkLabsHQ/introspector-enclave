@@ -1,8 +1,0 @@
-{
-  "devNitroIntrospector": {
-    "SecretKeyCiphertextParam": "/dev/NitroIntrospector/SecretKeyCiphertext",
-    "KMSKeyID": "5a16f3fa-6ddd-44f2-bbe9-87b03388b6b0",
-    "EC2InstanceRoleARN": "arn:aws:iam::043673801220:role/devNitroIntrospector-InstanceSSMCBFA3CF0-05X3tE4WdCaE",
-    "InstanceID": "i-0c456ab9afcaa7be8"
-  }
-}

@@ -1,0 +1,158 @@
+package introspector_enclave
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"gopkg.in/yaml.v3"
+)
+
+const configFile = "enclave.yaml"
+
+type Config struct {
+	Name         string    `yaml:"name"`
+	Version      string    `yaml:"version"`
+	Region       string    `yaml:"region"`
+	Account      string    `yaml:"account"`
+	Prefix       string    `yaml:"prefix"`
+	Profile      string    `yaml:"profile"`
+	App          AppConfig `yaml:"app"`
+	InstanceType string    `yaml:"instance_type"`
+	NixImage     string    `yaml:"nix_image"`
+	LockKMS      bool      `yaml:"lock_kms"`
+}
+
+type AppConfig struct {
+	Source         string            `yaml:"source"`
+	NixOwner       string            `yaml:"nix_owner"`
+	NixRepo        string            `yaml:"nix_repo"`
+	NixRev         string            `yaml:"nix_rev"`
+	NixHash        string            `yaml:"nix_hash"`
+	NixVendorHash  string            `yaml:"nix_vendor_hash"`
+	NixSubPackages []string          `yaml:"nix_sub_packages"`
+	BinaryName     string            `yaml:"binary_name"`
+	Port           int               `yaml:"port"`
+	Env            map[string]string `yaml:"env"`
+}
+
+func loadConfig() (*Config, error) {
+	root, err := findRepoRoot()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(root, configFile))
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w\nRun 'enclave init' to create one.", configFile, err)
+	}
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, fmt.Errorf("invalid %s: %w", configFile, err)
+	}
+	// Apply defaults.
+	if cfg.Prefix == "" {
+		cfg.Prefix = "dev"
+	}
+	if cfg.Version == "" {
+		cfg.Version = "dev"
+	}
+	if cfg.InstanceType == "" {
+		cfg.InstanceType = "m6i.xlarge"
+	}
+	if cfg.App.Port == 0 {
+		cfg.App.Port = 7074
+	}
+	if cfg.App.BinaryName == "" {
+		cfg.App.BinaryName = cfg.Name
+	}
+	if cfg.App.Source == "" {
+		cfg.App.Source = "nix"
+	}
+	// Validate required fields.
+	if cfg.Region == "" {
+		return nil, fmt.Errorf("%s: 'region' is required", configFile)
+	}
+	if cfg.Account == "" {
+		return nil, fmt.Errorf("%s: 'account' is required", configFile)
+	}
+	return &cfg, nil
+}
+
+// configEnv returns environment variables derived from the config, suitable
+// for passing to scripts.
+func (c *Config) configEnv() []string {
+	env := os.Environ()
+	env = append(env,
+		"CDK_DEPLOY_REGION="+c.Region,
+		"CDK_DEPLOY_ACCOUNT="+c.Account,
+		"CDK_PREFIX="+c.Prefix,
+		"VERSION="+c.Version,
+		"AWS_REGION="+c.Region,
+	)
+	if c.Profile != "" {
+		env = append(env, "AWS_PROFILE="+c.Profile)
+	}
+	if c.LockKMS {
+		env = append(env, "LOCK_KMS=1")
+	}
+	return env
+}
+
+// CDKOutputs represents the structure of cdk-outputs.json.
+type CDKOutputs map[string]map[string]string
+
+func loadCDKOutputs(root string) (CDKOutputs, error) {
+	data, err := os.ReadFile(filepath.Join(root, "cdk-outputs.json"))
+	if err != nil {
+		return nil, fmt.Errorf("cannot read cdk-outputs.json: %w\nRun 'enclave deploy' first.", err)
+	}
+	var outputs CDKOutputs
+	if err := json.Unmarshal(data, &outputs); err != nil {
+		return nil, fmt.Errorf("invalid cdk-outputs.json: %w", err)
+	}
+	return outputs, nil
+}
+
+// getOutput reads a value from CDK outputs, trying multiple key variants.
+func (o CDKOutputs) getOutput(stackName string, keys ...string) string {
+	stack, ok := o[stackName]
+	if !ok {
+		return ""
+	}
+	for _, key := range keys {
+		if v, ok := stack[key]; ok && v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// stackName returns the CDK stack name from the config.
+func (c *Config) stackName() string {
+	return c.Prefix + "NitroIntrospector"
+}
+
+// findRepoRoot walks up from cwd looking for enclave.yaml or .git.
+func findRepoRoot() (string, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return "", err
+	}
+	for {
+		if _, err := os.Stat(filepath.Join(dir, configFile)); err == nil {
+			return dir, nil
+		}
+		if _, err := os.Stat(filepath.Join(dir, ".git")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	// Fall back to cwd.
+	cwd, _ := os.Getwd()
+	return cwd, nil
+}
