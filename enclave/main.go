@@ -40,7 +40,15 @@ var PreviousPCR0 = "genesis"
 // compatible with nitriding's horizontal scaling (leader-worker key sync).
 var attestationKey *btcec.PrivateKey
 
-const introspectorBin = "/app/introspector"
+// appBinary returns the path to the upstream app binary.
+// Reads APP_BINARY_NAME from the environment (set via enclave.yaml env config),
+// falling back to "introspector" for backwards compatibility.
+func appBinary() string {
+	if name := os.Getenv("APP_BINARY_NAME"); name != "" {
+		return "/app/" + name
+	}
+	return "/app/introspector"
+}
 
 func main() {
 	log.Infof("introspector-init %s starting", Version)
@@ -95,16 +103,17 @@ func runSupervisor() {
 	}
 	go startReverseProxy(proxyPort, upstreamPort)
 
-	// Start upstream introspector as child process.
-	cmd := exec.Command(introspectorBin)
+	// Start upstream app as child process.
+	bin := appBinary()
+	cmd := exec.Command(bin)
 	cmd.Env = os.Environ()
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("failed to start %s: %s", introspectorBin, err)
+		log.Fatalf("failed to start %s: %s", bin, err)
 	}
-	log.Infof("started upstream introspector (PID %d) on port %s", cmd.Process.Pid, upstreamPort)
+	log.Infof("started upstream app %s (PID %d) on port %s", bin, cmd.Process.Pid, upstreamPort)
 
 	// Wait for either: child exit or SIGTERM.
 	sigCh := make(chan os.Signal, 1)
@@ -139,7 +148,6 @@ func startReverseProxy(proxyPort, upstreamPort string) {
 
 	mux.HandleFunc("GET /v1/enclave-info", handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", handleExportKey)
-	mux.HandleFunc("POST /v1/delete-kms-key", handleDeleteKMSKey)
 
 	// Forward everything else to upstream.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {

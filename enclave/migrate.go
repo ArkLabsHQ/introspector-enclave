@@ -118,68 +118,6 @@ func handleExportKey(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, `{"pcr0":"%s"}`, pcr0)
 }
 
-// handleDeleteKMSKey handles POST /v1/delete-kms-key.
-// Schedules deletion of the current KMS key (7-day pending window).
-// Authenticated with MigrationToken from SSM. One-shot via sync.Once.
-func handleDeleteKMSKey(w http.ResponseWriter, r *http.Request) {
-	var ok bool
-	deleteKMSOnce.Do(func() { ok = true })
-	if !ok {
-		http.Error(w, "already called", http.StatusGone)
-		return
-	}
-
-	ctx := r.Context()
-	deployment := getDeployment()
-
-	awsCfg, err := loadAWSConfigWithIMDS(ctx)
-	if err != nil {
-		log.Errorf("delete-kms-key: load AWS config: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
-
-	// Verify migration token.
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == "" {
-		http.Error(w, "missing authorization", http.StatusUnauthorized)
-		return
-	}
-
-	expectedToken, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/NitroIntrospector/MigrationToken", deployment))
-	if err != nil || token != expectedToken {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
-
-	// Read current KMS key ID.
-	keyID, err := getKMSKeyID(ctx, ssmClient)
-	if err != nil {
-		log.Errorf("delete-kms-key: get KMS key ID: %v", err)
-		http.Error(w, "KMS key ID not found", http.StatusInternalServerError)
-		return
-	}
-
-	// Schedule deletion.
-	kmsClient := kms.NewFromConfig(awsCfg)
-	pendingDays := int32(7)
-	_, err = kmsClient.ScheduleKeyDeletion(ctx, &kms.ScheduleKeyDeletionInput{
-		KeyId:               aws.String(keyID),
-		PendingWindowInDays: &pendingDays,
-	})
-	if err != nil {
-		log.Errorf("delete-kms-key: schedule deletion: %v", err)
-		http.Error(w, fmt.Sprintf("ScheduleKeyDeletion failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	log.Infof("delete-kms-key: scheduled deletion of KMS key %s (7-day pending window)", keyID)
-
-	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"key_id":"%s","status":"pending_deletion","pending_days":7}`, keyID)
-}
-
 // readMigrationPreviousPCR0 reads the previous enclave's PCR0 from SSM.
 // Returns empty string if not set (normal boot, no migration).
 func readMigrationPreviousPCR0(ctx context.Context) (string, error) {

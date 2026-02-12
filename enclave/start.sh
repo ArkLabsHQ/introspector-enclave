@@ -44,4 +44,4 @@ fi
 echo "nameserver 192.168.127.1" > /etc/resolv.conf
 
 # Start nitriding in background (it will set up networking via gvproxy)
-exec /app/nitriding ${NITRIDING_ARGS} -appcmd "/app/introspector-init"
+exec /app/nitriding ${NITRIDING_ARGS} -appcmd "/app/enclave-init"
