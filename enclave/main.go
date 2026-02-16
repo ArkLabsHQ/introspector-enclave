@@ -23,7 +23,6 @@ import (
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
 	"github.com/hf/nsm"
 	"github.com/hf/nsm/request"
-	log "github.com/sirupsen/logrus"
 )
 
 var Version = "dev"
@@ -36,88 +35,122 @@ var PreviousPCR0 = "genesis"
 // attestationKey is an ephemeral secp256k1 key generated fresh each boot.
 // Its public key hash is registered with nitriding via POST /enclave/hash,
 // embedding it as appKeyHash in the attestation document's UserData.
-// This provides per-response authentication independent of TLS and is
-// compatible with nitriding's horizontal scaling (leader-worker key sync).
 var attestationKey *btcec.PrivateKey
+
+// secretsDefs holds the configured secrets, loaded from ENCLAVE_SECRETS_CONFIG.
+var secretsDefs []SecretDef
+
+// initError captures any initialization error so it can be surfaced
+// via /v1/enclave-info instead of crashing the process.
+var initError string
+
+// SecretDef defines a secret managed by KMS inside the enclave.
+type SecretDef struct {
+	Name   string `json:"name"`
+	EnvVar string `json:"env_var"`
+}
+
+// loadSecretsConfig parses the ENCLAVE_SECRETS_CONFIG env var (JSON array).
+func loadSecretsConfig() ([]SecretDef, error) {
+	raw := os.Getenv("ENCLAVE_SECRETS_CONFIG")
+	if raw == "" {
+		return nil, nil
+	}
+	var secrets []SecretDef
+	if err := json.Unmarshal([]byte(raw), &secrets); err != nil {
+		return nil, fmt.Errorf("parse ENCLAVE_SECRETS_CONFIG: %w", err)
+	}
+	return secrets, nil
+}
 
 // appBinary returns the path to the upstream app binary.
 // Reads APP_BINARY_NAME from the environment (set via enclave.yaml env config),
-// falling back to "introspector" for backwards compatibility.
+// falling back to "app" for a generic default.
 func appBinary() string {
 	if name := os.Getenv("APP_BINARY_NAME"); name != "" {
 		return "/app/" + name
 	}
-	return "/app/introspector"
+	return "/app/app"
 }
 
 func main() {
-	log.Infof("introspector-init %s starting", Version)
-
-	// Normal KMS boot: deploy script ensures correct ciphertext + key ID in SSM.
-	if err := waitForSecretKeyFromKMS(context.Background()); err != nil {
-		log.Fatalf("failed to load secret key from KMS: %s", err)
+	if err := initEnclave(); err != nil {
+		initError = err.Error()
 	}
-
-	// Check if migrated (previous enclave's PCR0 stored in SSM by export handler).
-	if pcr0, err := readMigrationPreviousPCR0(context.Background()); err == nil {
-		PreviousPCR0 = pcr0
-		log.Infof("migrated from previous enclave (pcr0=%s)", pcr0)
-	}
-
-	// If migrated from a locked key, schedule deletion of the old KMS key.
-	deleteOldKMSKey(context.Background())
-
-	cfg, err := LoadConfig()
-	if err != nil {
-		log.Fatalf("invalid config: %s", err)
-	}
-
-	pubkeyBytes := cfg.SecretKey.PubKey().SerializeCompressed()
-
-	if err := extendPCR16WithPubkey(pubkeyBytes); err != nil {
-		log.Fatalf("failed to extend PCR16 with pubkey hash: %s", err)
-	}
-
-	// Generate ephemeral attestation key and bind into userData.
-	if err := generateAttestationKey(); err != nil {
-		log.Fatalf("failed to generate attestation key: %s", err)
-	}
-
-	log.Infof("previous_pcr0=%s", PreviousPCR0)
 	runSupervisor()
 }
 
-// runSupervisor starts the upstream introspector as a child process behind a
+// initEnclave performs all initialization steps, returning the first error
+// encountered. Non-fatal steps (migration) are best-effort.
+func initEnclave() error {
+	secrets, err := loadSecretsConfig()
+	if err != nil {
+		return fmt.Errorf("load secrets config: %w", err)
+	}
+	secretsDefs = secrets
+
+	// Generate ephemeral attestation key and register with nitriding ASAP.
+	// Only needs crypto/rand + localhost POST to nitriding (no AWS deps).
+	if err := generateAttestationKey(); err != nil {
+		return fmt.Errorf("generate attestation key: %w", err)
+	}
+
+	if len(secrets) > 0 {
+		if err := waitForSecretsFromKMS(context.Background(), secrets); err != nil {
+			return fmt.Errorf("load secrets from KMS: %w", err)
+		}
+
+		if err := extendPCRsWithSecretPubkeys(secrets); err != nil {
+			return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
+		}
+	}
+
+	// Best-effort migration check.
+	if pcr0, err := readMigrationPreviousPCR0(context.Background()); err == nil {
+		PreviousPCR0 = pcr0
+	}
+
+	deleteOldKMSKey(context.Background())
+	return nil
+}
+
+// runSupervisor starts the upstream app as a child process behind a
 // reverse proxy that signs all responses with the attestation key.
 func runSupervisor() {
-	// The upstream introspector listens on an internal port (7074).
-	// Our reverse proxy listens on the configured port (7073) and
-	// adds /v1/enclave-info before forwarding to upstream.
 	upstreamPort := "7074"
-	os.Setenv("INTROSPECTOR_PORT", upstreamPort)
+	os.Setenv("ENCLAVE_UPSTREAM_PORT", upstreamPort)
 
-	// Start the reverse proxy.
-	proxyPort := os.Getenv("INTROSPECTOR_PROXY_PORT")
+	proxyPort := os.Getenv("ENCLAVE_PROXY_PORT")
 	if proxyPort == "" {
 		proxyPort = "7073"
 	}
 	go startReverseProxy(proxyPort, upstreamPort)
 
-	// Start upstream app as child process.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
+
+	// If init failed, don't start the upstream app — just keep the
+	// reverse proxy alive so /v1/enclave-info can serve the error.
+	if initError != "" {
+		<-sigCh
+		return
+	}
+
 	bin := appBinary()
 	cmd := exec.Command(bin)
 	cmd.Env = os.Environ()
 	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+
+	// Capture stderr so we can surface the app's error via /v1/enclave-info.
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
 
 	if err := cmd.Start(); err != nil {
-		log.Fatalf("failed to start %s: %s", bin, err)
+		initError = fmt.Sprintf("failed to start %s: %s", bin, err)
+		fmt.Fprintf(os.Stderr, "%s\n", initError)
+		<-sigCh
+		return
 	}
-	log.Infof("started upstream app %s (PID %d) on port %s", bin, cmd.Process.Pid, upstreamPort)
-
-	// Wait for either: child exit or SIGTERM.
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT)
 
 	cmdDone := make(chan error, 1)
 	go func() {
@@ -127,19 +160,28 @@ func runSupervisor() {
 	select {
 	case err := <-cmdDone:
 		if err != nil {
-			log.Fatalf("introspector exited with error: %s", err)
+			stderr := strings.TrimSpace(stderrBuf.String())
+			if len(stderr) > 512 {
+				stderr = stderr[len(stderr)-512:]
+			}
+			if stderr != "" {
+				initError = fmt.Sprintf("upstream app exited: %s: %s", err, stderr)
+			} else {
+				initError = fmt.Sprintf("upstream app exited: %s", err)
+			}
+			fmt.Fprintf(os.Stderr, "%s\n", initError)
+			// Keep reverse proxy alive so /v1/enclave-info can report the error.
+			<-sigCh
 		}
-		log.Info("introspector exited cleanly")
-	case sig := <-sigCh:
-		log.Infof("received signal %s, shutting down", sig)
+	case <-sigCh:
 		cmd.Process.Signal(syscall.SIGTERM)
 		cmd.Wait()
 	}
 }
 
 // startReverseProxy runs an HTTP proxy on proxyPort that:
-// - Handles /v1/enclave-info locally
-// - Forwards everything else to the upstream introspector on upstreamPort
+// - Handles management endpoints locally (/v1/enclave-info, /v1/export-key, /v1/lock-pcr)
+// - Forwards everything else to the upstream app on upstreamPort
 func startReverseProxy(proxyPort, upstreamPort string) {
 	upstream, _ := url.Parse("http://127.0.0.1:" + upstreamPort)
 	proxy := httputil.NewSingleHostReverseProxy(upstream)
@@ -148,6 +190,7 @@ func startReverseProxy(proxyPort, upstreamPort string) {
 
 	mux.HandleFunc("GET /v1/enclave-info", handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", handleExportKey)
+	mux.HandleFunc("POST /v1/lock-pcr", handleLockPCR)
 
 	// Forward everything else to upstream.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -158,21 +201,24 @@ func startReverseProxy(proxyPort, upstreamPort string) {
 	var handler http.Handler = mux
 	handler = attestationSigningMiddleware(handler)
 
-	log.Infof("reverse proxy listening on :%s -> upstream :%s", proxyPort, upstreamPort)
 	if err := http.ListenAndServe(":"+proxyPort, handler); err != nil {
-		log.Fatalf("reverse proxy: %s", err)
+		fmt.Fprintf(os.Stderr, "reverse proxy: %s\n", err)
+		os.Exit(1)
 	}
 }
 
-// handleEnclaveInfo returns build-time and runtime metadata about this enclave.
+// handleEnclaveInfo returns build-time and runtime metadata about this enclave,
+// including any initialization error so callers can diagnose issues.
 func handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
 		Version           string `json:"version"`
 		PreviousPCR0      string `json:"previous_pcr0"`
 		AttestationPubkey string `json:"attestation_pubkey,omitempty"`
+		Error             string `json:"error,omitempty"`
 	}{
 		Version:      Version,
 		PreviousPCR0: PreviousPCR0,
+		Error:        initError,
 	}
 	if attestationKey != nil {
 		resp.AttestationPubkey = hex.EncodeToString(
@@ -182,38 +228,104 @@ func handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
-// extendPCR16WithPubkey extends PCR16 with SHA256(compressedPubkey) and locks it.
-func extendPCR16WithPubkey(compressedPubkey []byte) error {
+// handleLockPCR locks a user-defined PCR (16-32) to prevent further extension.
+func handleLockPCR(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		PCR uint `json:"pcr"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.PCR < 16 || req.PCR > 31 {
+		http.Error(w, "pcr must be in range [16, 31]", http.StatusBadRequest)
+		return
+	}
+
+	if err := lockPCR(req.PCR); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	fmt.Fprintf(w, `{"pcr":%d,"status":"locked"}`, req.PCR)
+}
+
+// extendPCR extends a PCR with the given data via the NSM.
+func extendPCR(index uint, data []byte) error {
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
 		return fmt.Errorf("open NSM session: %w", err)
 	}
 	defer session.Close()
 
-	hash := sha256.Sum256(compressedPubkey)
-
 	resp, err := session.Send(&request.ExtendPCR{
-		Index: 16,
-		Data:  hash[:],
+		Index: uint16(index),
+		Data:  data,
 	})
 	if err != nil {
-		return fmt.Errorf("ExtendPCR(16): %w", err)
+		return fmt.Errorf("ExtendPCR(%d): %w", index, err)
 	}
 	if resp.Error != "" {
-		return fmt.Errorf("ExtendPCR(16): NSM error: %s", resp.Error)
+		return fmt.Errorf("ExtendPCR(%d): NSM error: %s", index, resp.Error)
 	}
+	return nil
+}
 
-	resp, err = session.Send(&request.LockPCR{
-		Index: 16,
+// lockPCR locks a PCR to prevent further extension.
+func lockPCR(index uint) error {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return fmt.Errorf("open NSM session: %w", err)
+	}
+	defer session.Close()
+
+	resp, err := session.Send(&request.LockPCR{
+		Index: uint16(index),
 	})
 	if err != nil {
-		return fmt.Errorf("LockPCR(16): %w", err)
+		return fmt.Errorf("LockPCR(%d): %w", index, err)
 	}
 	if resp.Error != "" {
-		return fmt.Errorf("LockPCR(16): NSM error: %s", resp.Error)
+		return fmt.Errorf("LockPCR(%d): NSM error: %s", index, resp.Error)
 	}
+	return nil
+}
 
-	log.Infof("extended and locked PCR16 with pubkey hash (sha256: %s)", hex.EncodeToString(hash[:]))
+// extendPCRsWithSecretPubkeys derives the secp256k1 compressed public key for
+// each secret and extends PCR (16 + index) with SHA256(compressed_pubkey).
+// This binds the secret key identities into the attestation document so that
+// verifiers can confirm which keys the enclave holds without revealing the
+// private keys themselves.
+func extendPCRsWithSecretPubkeys(secrets []SecretDef) error {
+	for i, s := range secrets {
+		pcrIndex := uint(16) + uint(i)
+		if pcrIndex > 31 {
+			return fmt.Errorf("secret %q: PCR index %d exceeds 31", s.Name, pcrIndex)
+		}
+
+		secretHex := os.Getenv(s.EnvVar)
+		if secretHex == "" {
+			return fmt.Errorf("secret %q env var %s is empty", s.Name, s.EnvVar)
+		}
+
+		secretBytes, err := hex.DecodeString(secretHex)
+		if err != nil {
+			return fmt.Errorf("decode secret %q hex: %w", s.Name, err)
+		}
+
+		privKey, _ := btcec.PrivKeyFromBytes(secretBytes)
+		if privKey == nil {
+			return fmt.Errorf("secret %q: invalid secp256k1 private key", s.Name)
+		}
+
+		pubkeyBytes := privKey.PubKey().SerializeCompressed()
+		hash := sha256.Sum256(pubkeyBytes)
+
+		if err := extendPCR(pcrIndex, hash[:]); err != nil {
+			return fmt.Errorf("extend PCR%d with secret %q pubkey: %w", pcrIndex, s.Name, err)
+		}
+
+	}
 	return nil
 }
 
@@ -239,7 +351,7 @@ func generateAttestationKey() error {
 	hash := sha256.Sum256(pubkeyBytes)
 	hashB64 := base64.StdEncoding.EncodeToString(hash[:])
 
-	nitridingPort := os.Getenv("INTROSPECTOR_NITRIDING_INT_PORT")
+	nitridingPort := os.Getenv("ENCLAVE_NITRIDING_INT_PORT")
 	if nitridingPort == "" {
 		nitridingPort = "8080"
 	}
@@ -256,9 +368,6 @@ func generateAttestationKey() error {
 		return fmt.Errorf("POST /enclave/hash status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
 	}
 
-	log.Infof("generated attestation key, registered with nitriding (pubkey: %s, sha256: %s)",
-		hex.EncodeToString(pubkeyBytes),
-		hex.EncodeToString(hash[:]))
 	return nil
 }
 
@@ -272,7 +381,6 @@ func signResponse(body []byte) string {
 	msgHash := sha256.Sum256(body)
 	sig, err := schnorr.Sign(attestationKey, msgHash[:])
 	if err != nil {
-		log.Warnf("attestation sign failed: %v", err)
 		return ""
 	}
 	return hex.EncodeToString(sig.Serialize())

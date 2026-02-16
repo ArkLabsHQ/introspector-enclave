@@ -9,19 +9,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-const configFile = "enclave.yaml"
+const configFile = "enclave/enclave.yaml"
 
 type Config struct {
-	Name         string    `yaml:"name"`
-	Version      string    `yaml:"version"`
-	Region       string    `yaml:"region"`
-	Account      string    `yaml:"account"`
-	Prefix       string    `yaml:"prefix"`
-	Profile      string    `yaml:"profile"`
-	App          AppConfig `yaml:"app"`
-	InstanceType string    `yaml:"instance_type"`
-	NixImage     string    `yaml:"nix_image"`
-	LockKMS      bool      `yaml:"lock_kms"`
+	Name         string         `yaml:"name"`
+	Version      string         `yaml:"version"`
+	Region       string         `yaml:"region"`
+	Account      string         `yaml:"account"`
+	Prefix       string         `yaml:"prefix"`
+	Profile      string         `yaml:"profile"`
+	App          AppConfig      `yaml:"app"`
+	Secrets      []SecretConfig `yaml:"secrets"`
+	InstanceType string         `yaml:"instance_type"`
+	NixImage     string         `yaml:"nix_image"`
+	LockKMS      bool           `yaml:"lock_kms"`
 }
 
 type AppConfig struct {
@@ -33,8 +34,16 @@ type AppConfig struct {
 	NixVendorHash  string            `yaml:"nix_vendor_hash"`
 	NixSubPackages []string          `yaml:"nix_sub_packages"`
 	BinaryName     string            `yaml:"binary_name"`
-	Port           int               `yaml:"port"`
 	Env            map[string]string `yaml:"env"`
+}
+
+// SecretConfig defines a secret managed by KMS inside the enclave.
+// Each secret is stored as an encrypted ciphertext in SSM and decrypted
+// at boot via KMS attestation. The decrypted value is passed to the
+// upstream app as the specified environment variable.
+type SecretConfig struct {
+	Name   string `yaml:"name"`    // SSM parameter name component
+	EnvVar string `yaml:"env_var"` // Env var passed to upstream app
 }
 
 func loadConfig() (*Config, error) {
@@ -60,9 +69,6 @@ func loadConfig() (*Config, error) {
 	if cfg.InstanceType == "" {
 		cfg.InstanceType = "m6i.xlarge"
 	}
-	if cfg.App.Port == 0 {
-		cfg.App.Port = 7074
-	}
 	if cfg.App.BinaryName == "" {
 		cfg.App.BinaryName = cfg.Name
 	}
@@ -75,6 +81,20 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.Account == "" {
 		return nil, fmt.Errorf("%s: 'account' is required", configFile)
+	}
+	// Validate secrets.
+	seen := make(map[string]bool)
+	for i, s := range cfg.Secrets {
+		if s.Name == "" {
+			return nil, fmt.Errorf("%s: secrets[%d].name is required", configFile, i)
+		}
+		if s.EnvVar == "" {
+			return nil, fmt.Errorf("%s: secrets[%d].env_var is required", configFile, i)
+		}
+		if seen[s.Name] {
+			return nil, fmt.Errorf("%s: duplicate secret name %q", configFile, s.Name)
+		}
+		seen[s.Name] = true
 	}
 	return &cfg, nil
 }
@@ -130,7 +150,7 @@ func (o CDKOutputs) getOutput(stackName string, keys ...string) string {
 
 // stackName returns the CDK stack name from the config.
 func (c *Config) stackName() string {
-	return c.Prefix + "NitroIntrospector"
+	return c.Prefix + "Nitro" + c.Name
 }
 
 // findRepoRoot walks up from cwd looking for enclave.yaml or .git.

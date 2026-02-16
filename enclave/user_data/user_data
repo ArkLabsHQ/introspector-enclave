@@ -60,9 +60,9 @@ if [[ ! -d ./app/server ]]; then
 fi
 
 # Download pre-built EIF from S3 (built reproducibly with Nix)
-aws s3 cp ${__EIF_S3_URL__} /home/ec2-user/app/server/introspector.eif
-chmod 644 /home/ec2-user/app/server/introspector.eif
-chown ec2-user:ec2-user /home/ec2-user/app/server/introspector.eif
+aws s3 cp ${__EIF_S3_URL__} /home/ec2-user/app/server/enclave.eif
+chmod 644 /home/ec2-user/app/server/enclave.eif
+chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif
 
 # Pull gvproxy image for outbound networking
 ACCOUNT_ID=$( aws sts get-caller-identity | jq -r '.Account' )
@@ -79,13 +79,13 @@ aws s3 cp ${__IMDS_SYSTEMD_S3_URL__} /etc/systemd/system/enclave-imds-proxy.serv
 aws s3 cp ${__GVPROXY_SYSTEMD_S3_URL__} /etc/systemd/system/gvproxy.service
 
 cat <<EOF >> /etc/environment
-ENCLAVE_NAME=introspector
-EIF_PATH=/home/ec2-user/app/server/introspector.eif
-INTROSPECTOR_NITRIDING_ENABLED=true
-INTROSPECTOR_NITRIDING_FQDN=example.com
-INTROSPECTOR_KMS_KEY_ID=${__KMS_KEY_ID__}
-INTROSPECTOR_DEPLOYMENT=${__DEV_MODE__}
-INTROSPECTOR_AWS_REGION=${__REGION__}
+ENCLAVE_APP_NAME=${__APP_NAME__}
+EIF_PATH=/home/ec2-user/app/server/enclave.eif
+ENCLAVE_NITRIDING_ENABLED=true
+ENCLAVE_NITRIDING_FQDN=example.com
+ENCLAVE_KMS_KEY_ID=${__KMS_KEY_ID__}
+ENCLAVE_DEPLOYMENT=${__DEV_MODE__}
+ENCLAVE_AWS_REGION=${__REGION__}
 EOF
 
 systemctl enable --now enclave-watchdog.service

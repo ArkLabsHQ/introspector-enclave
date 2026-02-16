@@ -31,13 +31,22 @@ app:
   nix_sub_packages:              # Go sub-packages to build
     - "."
   binary_name: ""                # Output binary name (defaults to 'name')
-  port: 7074                     # Port the app listens on inside the enclave
 
   # Environment variables baked into the EIF.
   # Template vars: {{region}}, {{prefix}}, {{version}}
   env:
     # MY_APP_DATA_DIR: /app/data
     # MY_APP_REGION: "{{region}}"
+
+# Secrets managed by KMS inside the enclave.
+# Each secret is generated as 32 random bytes, encrypted with KMS,
+# stored in SSM, and decrypted at boot via attestation.
+# The decrypted value (hex-encoded) is set as the specified env var.
+secrets:
+  - name: signing_key
+    env_var: APP_SIGNING_KEY
+  # - name: api_token
+  #   env_var: APP_API_TOKEN
 `
 
 func initCmd() *cobra.Command {
@@ -57,13 +66,32 @@ func runInit(cmd *cobra.Command, args []string) error {
 	}
 	cfgPath := filepath.Join(cwd, configFile)
 
-	// If enclave.yaml doesn't exist, write the template.
+	// If enclave/enclave.yaml doesn't exist, create the directory, write the
+	// config template, and scaffold all framework files needed by CDK and Nix.
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		enclaveDir := filepath.Join(cwd, "enclave")
+		if err := os.MkdirAll(enclaveDir, 0755); err != nil {
+			return fmt.Errorf("create enclave/ directory: %w", err)
+		}
 		if err := os.WriteFile(cfgPath, []byte(configTemplate), 0644); err != nil {
 			return fmt.Errorf("write %s: %w", configFile, err)
 		}
-		fmt.Printf("Created %s template.\n", cfgPath)
-		fmt.Println("Edit it with your app details, then run 'enclave init' again to validate.")
+		fmt.Printf("Created %s\n", configFile)
+
+		// Write framework files (gvproxy, systemd units, scripts, user_data, start.sh).
+		for _, f := range getFrameworkFiles() {
+			destPath := filepath.Join(cwd, f.RelPath)
+			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
+				return fmt.Errorf("create directory for %s: %w", f.RelPath, err)
+			}
+			if err := os.WriteFile(destPath, []byte(f.Content), f.Mode); err != nil {
+				return fmt.Errorf("write %s: %w", f.RelPath, err)
+			}
+			fmt.Printf("Created %s\n", f.RelPath)
+		}
+
+		fmt.Println()
+		fmt.Println("Edit enclave/enclave.yaml with your app details, then run 'enclave init' again to validate.")
 		return nil
 	}
 
@@ -118,9 +146,14 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  App Repo:    %s/%s\n", cfg.App.NixOwner, cfg.App.NixRepo)
 	fmt.Printf("  App Rev:     %s\n", cfg.App.NixRev)
 	fmt.Printf("  Binary:      %s\n", cfg.App.BinaryName)
-	fmt.Printf("  Port:        %d\n", cfg.App.Port)
 	if len(cfg.App.Env) > 0 {
 		fmt.Printf("  Env vars:    %d\n", len(cfg.App.Env))
+	}
+	if len(cfg.Secrets) > 0 {
+		fmt.Printf("  Secrets:     %d\n", len(cfg.Secrets))
+		for _, s := range cfg.Secrets {
+			fmt.Printf("    - %s -> %s\n", s.Name, s.EnvVar)
+		}
 	}
 	fmt.Println()
 	fmt.Println("Next: enclave build")

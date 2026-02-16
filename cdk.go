@@ -21,12 +21,16 @@ type NitroIntrospectorStackProps struct {
 	Deployment   string
 	RepoRoot     string
 	InstanceType string
+	AppName      string
+	Secrets      []SecretConfig
 }
 
 func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *NitroIntrospectorStackProps) awscdk.Stack {
 	deployment := "dev"
 	repoRoot := "."
 	instanceType := "m6i.xlarge"
+	appName := "app"
+	var secrets []SecretConfig
 	stackProps := awscdk.StackProps{}
 	if props != nil {
 		stackProps = props.StackProps
@@ -39,6 +43,10 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		if props.InstanceType != "" {
 			instanceType = props.InstanceType
 		}
+		if props.AppName != "" {
+			appName = props.AppName
+		}
+		secrets = props.Secrets
 	}
 
 	stack := awscdk.NewStack(scope, jsii.String(id), &stackProps)
@@ -88,34 +96,42 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		Path: jsii.String(repoPath("enclave/systemd/gvproxy.service")),
 	})
 
-	secretCiphertextParam := awsssm.NewStringParameter(stack, jsii.String("SecretKeyCiphertext"), &awsssm.StringParameterProps{
-		StringValue:   jsii.String("UNSET"),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/SecretKeyCiphertext", deployment)),
-	})
+	// Create SSM parameters for each configured secret.
+	var secretParams []awsssm.StringParameter
+	for _, secret := range secrets {
+		param := awsssm.NewStringParameter(stack, jsii.String("Secret_"+secret.Name), &awsssm.StringParameterProps{
+			StringValue:   jsii.String("UNSET"),
+			ParameterName: jsii.String(fmt.Sprintf("/%s/%s/%s/Ciphertext", deployment, appName, secret.Name)),
+		})
+		secretParams = append(secretParams, param)
 
+		// Migration ciphertext per secret.
+		migParam := awsssm.NewStringParameter(stack, jsii.String("Migration_"+secret.Name), &awsssm.StringParameterProps{
+			StringValue:   jsii.String("UNSET"),
+			ParameterName: jsii.String(fmt.Sprintf("/%s/%s/Migration/%s/Ciphertext", deployment, appName, secret.Name)),
+		})
+		secretParams = append(secretParams, migParam)
+	}
+
+	// Shared migration parameters (one per deployment, not per secret).
 	migrationTokenParam := awsssm.NewStringParameter(stack, jsii.String("MigrationToken"), &awsssm.StringParameterProps{
 		StringValue:   jsii.String("UNSET"),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationToken", deployment)),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationToken", deployment, appName)),
 	})
 
 	migrationKMSKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("MigrationKMSKeyID"), &awsssm.StringParameterProps{
 		StringValue:   jsii.String("UNSET"),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationKMSKeyID", deployment)),
-	})
-
-	migrationCiphertextParam := awsssm.NewStringParameter(stack, jsii.String("MigrationCiphertext"), &awsssm.StringParameterProps{
-		StringValue:   jsii.String("UNSET"),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationCiphertext", deployment)),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName)),
 	})
 
 	migrationPreviousPCR0Param := awsssm.NewStringParameter(stack, jsii.String("MigrationPreviousPCR0"), &awsssm.StringParameterProps{
 		StringValue:   jsii.String("UNSET"),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationPreviousPCR0", deployment)),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)),
 	})
 
 	migrationOldKMSKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("MigrationOldKMSKeyID"), &awsssm.StringParameterProps{
 		StringValue:   jsii.String("UNSET"),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationOldKMSKeyID", deployment)),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName)),
 	})
 
 	vpc := awsec2.NewVpc(stack, jsii.String("VPC"), &awsec2.VpcProps{
@@ -164,7 +180,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	nitroInstanceSG := awsec2.NewSecurityGroup(stack, jsii.String("NitroInstanceSG"), &awsec2.SecurityGroupProps{
 		Vpc:              vpc,
 		AllowAllOutbound: jsii.Bool(true),
-		Description:      jsii.String("Private SG for Nitro Introspector EC2 instance"),
+		Description:      jsii.String("Private SG for Nitro Enclave EC2 instance"),
 	})
 
 	nitroInstanceSG.AddIngressRule(
@@ -205,12 +221,13 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	enclaveInitSystemd.GrantRead(role)
 	imdsSystemd.GrantRead(role)
 	gvproxySystemd.GrantRead(role)
-	secretCiphertextParam.GrantRead(role)
-	secretCiphertextParam.GrantWrite(role)
+	// Grant access to all per-secret SSM parameters (ciphertext + migration).
+	for _, param := range secretParams {
+		param.GrantRead(role)
+		param.GrantWrite(role)
+	}
 	migrationTokenParam.GrantRead(role)
 	migrationKMSKeyIDParam.GrantRead(role)
-	migrationCiphertextParam.GrantRead(role)
-	migrationCiphertextParam.GrantWrite(role)
 	migrationPreviousPCR0Param.GrantRead(role)
 	migrationPreviousPCR0Param.GrantWrite(role)
 	migrationOldKMSKeyIDParam.GrantRead(role)
@@ -227,6 +244,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 
 	mappings := map[string]*string{
 		"__DEV_MODE__":                    jsii.String(deployment),
+		"__APP_NAME__":                    jsii.String(appName),
 		"__GVPROXY_IMAGE_URI__":           outboundProxyImage.ImageUri(),
 		"__EIF_S3_URL__":                  enclaveEif.S3ObjectUrl(),
 		"__ENCLAVE_INIT_S3_URL__":         enclaveInit.S3ObjectUrl(),
@@ -274,7 +292,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 
 	kmsKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("KMSKeyID"), &awsssm.StringParameterProps{
 		StringValue:   encryptionKey.KeyId(),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/NitroIntrospector/KMSKeyID", deployment)),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)),
 	})
 	kmsKeyIDParam.GrantRead(role)
 
@@ -286,11 +304,6 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	awscdk.NewCfnOutput(stack, jsii.String("KMS Key ID"), &awscdk.CfnOutputProps{
 		Value:       encryptionKey.KeyId(),
 		Description: jsii.String("KMS Key ID"),
-	})
-
-	awscdk.NewCfnOutput(stack, jsii.String("SecretKeyCiphertextParam"), &awscdk.CfnOutputProps{
-		Value:       secretCiphertextParam.ParameterName(),
-		Description: jsii.String("SSM parameter for secret key ciphertext"),
 	})
 
 	awscdk.NewCfnOutput(stack, jsii.String("Instance ID"), &awscdk.CfnOutputProps{

@@ -19,8 +19,6 @@ build-config.json
 # Enclave CLI config (contains account IDs)
 enclave.yaml
 
-# CLI binary
-enclave
 
 # Built binaries
 introspector

@@ -43,7 +43,7 @@
           pname = "enclave-init";
           inherit version src;
 
-          vendorHash = "sha256-Su+49otxVLeqvSNCn0SFRpT1tASt5iwklEz29CyxCqE=";
+          vendorHash = "sha256-rNodO+mGTZv5DY+PAk8tIfhhysfP6IuP3LgWvV4rKKc=";
 
           subPackages = [ "." ];
           env.CGO_ENABLED = "0";
@@ -156,6 +156,9 @@
           pathsToLink = [ "/" ];
         };
 
+        # Secrets config JSON baked into the EIF for runtime discovery.
+        secretsCfgJson = builtins.toJSON (buildCfg.secrets or []);
+
         # Environment variables for the enclave.
         # Standard vars + all app-specific vars from build-config.json.
         enclaveEnv = let
@@ -166,6 +169,9 @@
           PATH=/app:/bin:/usr/bin
           SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
           AWS_REGION=${region}
+          ENCLAVE_APP_NAME=${buildCfg.name}
+          ENCLAVE_SECRETS_CONFIG=${secretsCfgJson}
+          ENCLAVE_DEPLOYMENT=${deployment}
           ${appEnvLines}
         '';
 

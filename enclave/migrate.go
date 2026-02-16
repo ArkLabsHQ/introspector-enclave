@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"os"
@@ -21,9 +22,8 @@ var exportOnce sync.Once
 var deleteKMSOnce sync.Once
 
 // handleExportKey handles POST /v1/export-key.
-// Called by the deploy script during migration to export the signing key
-// encrypted with a temporary KMS key. The encrypted key is stored in SSM
-// for the new enclave to decrypt on boot.
+// Exports all configured secrets encrypted with a temporary migration KMS key.
+// Each secret's ciphertext is stored in SSM for the new enclave to decrypt on boot.
 //
 // One-shot: responds exactly once, then returns 410 Gone.
 func handleExportKey(w http.ResponseWriter, r *http.Request) {
@@ -36,6 +36,7 @@ func handleExportKey(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 	deployment := getDeployment()
+	appName := getAppName()
 
 	// Load AWS clients.
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
@@ -53,54 +54,61 @@ func handleExportKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expectedToken, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/NitroIntrospector/MigrationToken", deployment))
+	expectedToken, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationToken", deployment, appName))
 	if err != nil || token != expectedToken {
 		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	// Read signing key from environment.
-	secretKey := os.Getenv("INTROSPECTOR_SECRET_KEY")
-	if secretKey == "" {
-		http.Error(w, "signing key not loaded", http.StatusServiceUnavailable)
-		return
-	}
-
-	keyBytes, err := hex.DecodeString(secretKey)
-	if err != nil {
-		http.Error(w, "invalid key format", http.StatusInternalServerError)
-		return
-	}
-
 	// Read migration KMS key ID.
-	migrationKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/NitroIntrospector/MigrationKMSKeyID", deployment))
+	migrationKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName))
 	if err != nil {
 		log.Errorf("export-key: migration KMS key ID: %v", err)
 		http.Error(w, "migration key not configured", http.StatusInternalServerError)
 		return
 	}
 
-	// Encrypt signing key with migration KMS key (no attestation needed for Encrypt).
 	kmsClient := kms.NewFromConfig(awsCfg)
-	ciphertextB64, err := encryptWithKMS(ctx, kmsClient, migrationKeyID, keyBytes)
-	if err != nil {
-		log.Errorf("export-key: KMS encrypt: %v", err)
-		http.Error(w, "KMS encrypt failed", http.StatusInternalServerError)
-		return
-	}
 
-	// Store migration ciphertext in SSM.
-	ciphertextParam := fmt.Sprintf("/%s/NitroIntrospector/MigrationCiphertext", deployment)
-	if err := storeCiphertextInSSM(ctx, ssmClient, ciphertextParam, ciphertextB64); err != nil {
-		log.Errorf("export-key: store ciphertext: %v", err)
-		http.Error(w, "SSM store failed", http.StatusInternalServerError)
-		return
+	// Export all configured secrets.
+	var exported []string
+	for _, secret := range secretsDefs {
+		secretValue := os.Getenv(secret.EnvVar)
+		if secretValue == "" {
+			log.Warnf("export-key: secret %s (env=%s) not loaded, skipping", secret.Name, secret.EnvVar)
+			continue
+		}
+
+		keyBytes, err := hex.DecodeString(secretValue)
+		if err != nil {
+			log.Errorf("export-key: invalid hex for %s: %v", secret.Name, err)
+			http.Error(w, fmt.Sprintf("invalid key format for %s", secret.Name), http.StatusInternalServerError)
+			return
+		}
+
+		// Encrypt with migration KMS key.
+		ciphertextB64, err := encryptWithKMS(ctx, kmsClient, migrationKeyID, keyBytes)
+		if err != nil {
+			log.Errorf("export-key: KMS encrypt %s: %v", secret.Name, err)
+			http.Error(w, fmt.Sprintf("KMS encrypt failed for %s", secret.Name), http.StatusInternalServerError)
+			return
+		}
+
+		// Store migration ciphertext in SSM.
+		ciphertextParam := fmt.Sprintf("/%s/%s/Migration/%s/Ciphertext", deployment, appName, secret.Name)
+		if err := storeCiphertextInSSM(ctx, ssmClient, ciphertextParam, ciphertextB64); err != nil {
+			log.Errorf("export-key: store ciphertext for %s: %v", secret.Name, err)
+			http.Error(w, fmt.Sprintf("SSM store failed for %s", secret.Name), http.StatusInternalServerError)
+			return
+		}
+
+		exported = append(exported, secret.Name)
 	}
 
 	// Store this enclave's PCR0 for the attestation chain.
 	pcr0 := getPCR0()
 	if pcr0 != "" {
-		pcr0Param := fmt.Sprintf("/%s/NitroIntrospector/MigrationPreviousPCR0", deployment)
+		pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
 		_, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
 			Name:      aws.String(pcr0Param),
 			Value:     aws.String(pcr0),
@@ -112,10 +120,17 @@ func handleExportKey(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	log.Infof("export-key: signing key exported (pcr0=%s)", pcr0)
+	log.Infof("export-key: exported %d secret(s) (pcr0=%s)", len(exported), pcr0)
 
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"pcr0":"%s"}`, pcr0)
+	resp := struct {
+		PCR0     string   `json:"pcr0"`
+		Exported []string `json:"exported"`
+	}{
+		PCR0:     pcr0,
+		Exported: exported,
+	}
+	json.NewEncoder(w).Encode(resp)
 }
 
 // readMigrationPreviousPCR0 reads the previous enclave's PCR0 from SSM.
@@ -127,12 +142,12 @@ func readMigrationPreviousPCR0(ctx context.Context) (string, error) {
 	}
 	ssmClient := ssm.NewFromConfig(awsCfg)
 	deployment := getDeployment()
-	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/NitroIntrospector/MigrationPreviousPCR0", deployment))
+	appName := getAppName()
+	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName))
 }
 
 // deleteOldKMSKey checks if MigrationOldKMSKeyID is set in SSM. If so,
 // schedules the old KMS key for deletion and clears the parameter.
-// Called on boot after the new enclave successfully decrypts its signing key.
 func deleteOldKMSKey(ctx context.Context) {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
@@ -140,8 +155,9 @@ func deleteOldKMSKey(ctx context.Context) {
 	}
 	ssmClient := ssm.NewFromConfig(awsCfg)
 	deployment := getDeployment()
+	appName := getAppName()
 
-	oldKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/NitroIntrospector/MigrationOldKMSKeyID", deployment))
+	oldKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName))
 	if err != nil {
 		return // not set — normal boot, no old key to delete
 	}
@@ -160,7 +176,7 @@ func deleteOldKMSKey(ctx context.Context) {
 
 	// Clear the parameter so we don't try again on next reboot.
 	_, _ = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
-		Name:      aws.String(fmt.Sprintf("/%s/NitroIntrospector/MigrationOldKMSKeyID", deployment)),
+		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName)),
 		Value:     aws.String("UNSET"),
 		Type:      ssmtypes.ParameterTypeString,
 		Overwrite: aws.Bool(true),
@@ -188,11 +204,21 @@ func readSSMParam(ctx context.Context, ssmClient *ssm.Client, paramName string) 
 
 // getDeployment returns the deployment prefix from environment.
 func getDeployment() string {
-	deployment := strings.TrimSpace(os.Getenv("INTROSPECTOR_DEPLOYMENT"))
-	if deployment == "" {
-		deployment = "dev"
+	if d := strings.TrimSpace(os.Getenv("ENCLAVE_DEPLOYMENT")); d != "" {
+		return d
 	}
-	return deployment
+	if d := strings.TrimSpace(os.Getenv("INTROSPECTOR_DEPLOYMENT")); d != "" {
+		return d
+	}
+	return "dev"
+}
+
+// getAppName returns the app name from environment.
+func getAppName() string {
+	if name := strings.TrimSpace(os.Getenv("ENCLAVE_APP_NAME")); name != "" {
+		return name
+	}
+	return "app"
 }
 
 // getPCR0 returns this enclave's PCR0 from the NSM attestation document.

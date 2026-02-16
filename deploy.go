@@ -54,7 +54,7 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	fmt.Printf("[deploy] PCR0 from build: %s\n", pcr0)
 
 	// Step 2: Detect upgrade mode.
-	// An upgrade is when the instance is already running with a signing key.
+	// An upgrade is when the instance is already running with initialized secrets.
 	stack := cfg.stackName()
 	outputsPath := filepath.Join(root, "cdk-outputs.json")
 
@@ -67,8 +67,8 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 			instanceID = outputs.getOutput(stack, "InstanceID", "InstanceId", "Instance ID")
 			if instanceID != "" {
 				state, stateErr := ac.getInstanceState(ctx, instanceID)
-				if stateErr == nil && state == "running" {
-					cipher, _ := ac.getParameter(ctx, cfg.ssmParam("SecretKeyCiphertext"))
+				if stateErr == nil && state == "running" && len(cfg.Secrets) > 0 {
+					cipher, _ := ac.getParameter(ctx, cfg.ssmParam(cfg.Secrets[0].Name+"/Ciphertext"))
 					if cipher != "" && cipher != "UNSET" {
 						isUpgrade = true
 					}
@@ -254,7 +254,7 @@ func deployUpgradeLocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0,
 
 	// Step 1: Create new KMS key for the new enclave version.
 	newKMSKeyID, err := ac.createKey(ctx,
-		fmt.Sprintf("NitroIntrospector migration key for PCR0 %s...", pcr0[:16]))
+		fmt.Sprintf("%s migration key for PCR0 %s...", cfg.Name, pcr0[:16]))
 	if err != nil {
 		return fmt.Errorf("create migration KMS key: %w", err)
 	}
@@ -291,39 +291,48 @@ func deployUpgradeLocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0,
 		`curl -sf -k https://127.0.0.1:443/v1/export-key -X POST -H 'Authorization: Bearer %s'`,
 		migrationToken)
 
-	if err := ac.runOnHost(ctx, instanceID, "export signing key from old enclave", []string{exportCmd}); err != nil {
+	if err := ac.runOnHost(ctx, instanceID, "export secrets from old enclave", []string{exportCmd}); err != nil {
 		fmt.Println("[deploy] Export failed, cleaning up")
 		ac.resetParameter(ctx, cfg.ssmParam("MigrationToken"))
 		ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-		return fmt.Errorf("export signing key from old enclave: %w", err)
+		return fmt.Errorf("export secrets from old enclave: %w", err)
 	}
 
-	// Step 6: Wait for MigrationCiphertext to appear in SSM.
-	fmt.Println("[deploy] Waiting for migration ciphertext...")
-	var migrationCiphertext string
+	// Step 6: Wait for per-secret migration ciphertexts to appear in SSM.
+	fmt.Println("[deploy] Waiting for migration ciphertexts...")
 	maxWait := 60
+	allFound := false
 	for elapsed := 0; elapsed < maxWait; elapsed += 3 {
-		ct, _ := ac.getParameter(ctx, cfg.ssmParam("MigrationCiphertext"))
-		if ct != "" && ct != "UNSET" {
-			migrationCiphertext = ct
-			fmt.Println("[deploy] Migration ciphertext stored in SSM")
+		found := 0
+		for _, secret := range cfg.Secrets {
+			ct, _ := ac.getParameter(ctx, cfg.ssmParam("Migration/"+secret.Name+"/Ciphertext"))
+			if ct != "" && ct != "UNSET" {
+				found++
+			}
+		}
+		if found == len(cfg.Secrets) {
+			allFound = true
+			fmt.Printf("[deploy] All %d migration ciphertexts stored in SSM\n", found)
 			break
 		}
 		time.Sleep(3 * time.Second)
-		fmt.Printf("[deploy] Waiting... (%ds/%ds)\n", elapsed+3, maxWait)
+		fmt.Printf("[deploy] Waiting... (%d/%d secrets, %ds/%ds)\n", found, len(cfg.Secrets), elapsed+3, maxWait)
 	}
 
-	if migrationCiphertext == "" {
+	if !allFound {
 		ac.resetParameter(ctx, cfg.ssmParam("MigrationToken"))
 		ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-		return fmt.Errorf("timed out waiting for migration ciphertext")
+		return fmt.Errorf("timed out waiting for migration ciphertexts")
 	}
 
-	// Step 7: Copy migration ciphertext to SecretKeyCiphertext.
-	if err := ac.putParameter(ctx, cfg.ssmParam("SecretKeyCiphertext"), migrationCiphertext); err != nil {
-		return fmt.Errorf("copy migration ciphertext to SecretKeyCiphertext: %w", err)
+	// Step 7: Copy each migration ciphertext to its permanent location.
+	for _, secret := range cfg.Secrets {
+		migCipher, _ := ac.getParameter(ctx, cfg.ssmParam("Migration/"+secret.Name+"/Ciphertext"))
+		if err := ac.putParameter(ctx, cfg.ssmParam(secret.Name+"/Ciphertext"), migCipher); err != nil {
+			return fmt.Errorf("copy migration ciphertext for %s: %w", secret.Name, err)
+		}
 	}
-	fmt.Println("[deploy] Copied migration ciphertext to SecretKeyCiphertext")
+	fmt.Printf("[deploy] Copied %d migration ciphertexts to permanent locations\n", len(cfg.Secrets))
 
 	// Step 8: Update KMSKeyID to the new key.
 	if err := ac.putParameter(ctx, cfg.ssmParam("KMSKeyID"), newKMSKeyID); err != nil {
@@ -339,7 +348,9 @@ func deployUpgradeLocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0,
 	// Step 10: Clean up migration SSM params.
 	ac.resetParameter(ctx, cfg.ssmParam("MigrationToken"))
 	ac.resetParameter(ctx, cfg.ssmParam("MigrationKMSKeyID"))
-	ac.resetParameter(ctx, cfg.ssmParam("MigrationCiphertext"))
+	for _, secret := range cfg.Secrets {
+		ac.resetParameter(ctx, cfg.ssmParam("Migration/"+secret.Name+"/Ciphertext"))
+	}
 
 	fmt.Println()
 	fmt.Println("[deploy] Locked-key migration complete.")
@@ -522,7 +533,7 @@ func readPCR0(root string) (string, error) {
 
 // ssmParam returns the full SSM parameter path for a given parameter name.
 func (c *Config) ssmParam(name string) string {
-	return fmt.Sprintf("/%s/NitroIntrospector/%s", c.Prefix, name)
+	return fmt.Sprintf("/%s/%s/%s", c.Prefix, c.Name, name)
 }
 
 // eifBucket returns the S3 bucket name used for EIF transfers during upgrades.
