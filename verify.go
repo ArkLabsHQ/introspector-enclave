@@ -5,11 +5,11 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/sha512"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -23,18 +23,22 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// errAppKeyNotReady is returned when the attestation document's appKeyHash is
+// all zeros, meaning enclave-init hasn't registered its key with nitriding yet.
+var errAppKeyNotReady = errors.New("attestation key not yet registered (appKeyHash is all zeros)")
+
 func verifyCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "verify",
 		Short: "Verify enclave attestation",
-		Long:  "Connects to the enclave, verifies PCR0/PCR16 attestation, and checks response signatures.",
+		Long:  "Connects to the enclave, verifies PCR0 attestation, and checks response signatures.",
 		RunE:  runVerify,
 	}
 	cmd.Flags().Bool("verify-build", false, "Rebuild EIF locally and compare PCR0")
 	cmd.Flags().Bool("strict-tls", false, "Require CA-signed TLS certificate")
 	cmd.Flags().String("expected-pcr0", "", "Expected PCR0 hex (overrides auto-detection)")
-	cmd.Flags().Bool("verify-pubkey", true, "Verify that /v1/info pubkey matches attestation PCR16 hash")
 	cmd.Flags().Bool("verify-attestation-key", true, "Verify attestation key via UserData appKeyHash and test response signature")
+	cmd.Flags().Int("wait", 0, "Wait up to N seconds for enclave to become reachable (0 = no retry)")
 	return cmd
 }
 
@@ -77,20 +81,44 @@ func runVerify(cmd *cobra.Command, args []string) error {
 	strictTLS, _ := cmd.Flags().GetBool("strict-tls")
 	client := verifyHTTPClient(!strictTLS)
 
-	attestResult, err := verifyAttestation(client, baseURL, pcr0)
-	if err != nil {
-		return fmt.Errorf("attestation verification failed: %w", err)
-	}
+	waitSec, _ := cmd.Flags().GetInt("wait")
+	doVerifyKey, _ := cmd.Flags().GetBool("verify-attestation-key")
 
-	if doVerify, _ := cmd.Flags().GetBool("verify-pubkey"); doVerify {
-		if err := verifyPubkeyBinding(client, baseURL, attestResult); err != nil {
-			return fmt.Errorf("pubkey binding verification failed: %w", err)
+	// runAllChecks performs attestation verification and optionally key binding check.
+	// Returns nil on full success, or an error (which may be retryable).
+	runAllChecks := func() error {
+		result, err := verifyAttestation(client, baseURL, pcr0)
+		if err != nil {
+			return err
 		}
+		if doVerifyKey {
+			if err := verifyAttestationKeyBinding(client, baseURL, result); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 
-	if doVerify, _ := cmd.Flags().GetBool("verify-attestation-key"); doVerify {
-		if err := verifyAttestationKeyBinding(client, baseURL, attestResult); err != nil {
-			return fmt.Errorf("attestation key verification failed: %w", err)
+	if waitSec > 0 {
+		deadline := time.Now().Add(time.Duration(waitSec) * time.Second)
+		interval := 5 * time.Second
+		attempt := 0
+		for {
+			attempt++
+			err = runAllChecks()
+			if err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				return fmt.Errorf("verification failed after %ds: %w", waitSec, err)
+			}
+			remaining := time.Until(deadline).Truncate(time.Second)
+			fmt.Printf("[verify] Attempt %d failed (%s), retrying... (%s remaining)\n", attempt, shortErr(err), remaining)
+			time.Sleep(interval)
+		}
+	} else {
+		if err := runAllChecks(); err != nil {
+			return fmt.Errorf("verification failed: %w", err)
 		}
 	}
 
@@ -175,6 +203,7 @@ func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) (*nitr
 		if !ok {
 			return nil, fmt.Errorf("attestation missing PCR0")
 		}
+
 		if !strings.EqualFold(hex.EncodeToString(pcr0), expectedPCR0) {
 			return nil, fmt.Errorf("PCR0 mismatch: expected %s, got %s", expectedPCR0, hex.EncodeToString(pcr0))
 		}
@@ -182,80 +211,6 @@ func verifyAttestation(client *http.Client, baseURL, expectedPCR0 string) (*nitr
 
 	fmt.Println("[verify] Attestation document verified.")
 	return result, nil
-}
-
-// --- PCR16 pubkey binding ---
-
-// verifyPubkeyBinding fetches the signer pubkey from /v1/info and verifies
-// that its hash matches PCR16 in the attestation document.
-//
-// The enclave extends PCR16 with SHA256(compressedPubkey) and locks it.
-// PCR extension: new = SHA384(old || data), starting from 48 zero bytes.
-// So: PCR16 = SHA384(zeros_48 || SHA256(pubkey))
-func verifyPubkeyBinding(client *http.Client, baseURL string, attestResult *nitrite.Result) error {
-	if attestResult == nil || attestResult.Document == nil {
-		return fmt.Errorf("no attestation result to verify against")
-	}
-
-	pcr16, ok := attestResult.Document.PCRs[16]
-	if !ok || len(pcr16) == 0 {
-		return fmt.Errorf("attestation missing PCR16; enclave did not extend PCR16 with pubkey hash")
-	}
-
-	allZero := true
-	for _, b := range pcr16 {
-		if b != 0 {
-			allZero = false
-			break
-		}
-	}
-	if allZero {
-		return fmt.Errorf("attestation PCR16 is all zeros; enclave did not register its signing pubkey")
-	}
-
-	url := strings.TrimRight(baseURL, "/") + "/v1/info"
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
-	if err != nil {
-		return fmt.Errorf("create info request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return fmt.Errorf("fetch /v1/info: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("/v1/info status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
-	}
-
-	var info struct {
-		SignerPubkey string `json:"signerPubkey"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
-		return fmt.Errorf("decode /v1/info: %w", err)
-	}
-
-	pubkeyBytes, err := hex.DecodeString(info.SignerPubkey)
-	if err != nil {
-		return fmt.Errorf("decode signer pubkey hex: %w", err)
-	}
-
-	pubkeyHash := sha256.Sum256(pubkeyBytes)
-	extendData := make([]byte, 48+len(pubkeyHash))
-	copy(extendData[48:], pubkeyHash[:])
-	expectedPCR16 := sha512.Sum384(extendData)
-
-	if !bytes.Equal(expectedPCR16[:], pcr16) {
-		return fmt.Errorf("PCR16 mismatch: expected SHA384(zeros48 || SHA256(%s)) = %s, got %s",
-			info.SignerPubkey,
-			hex.EncodeToString(expectedPCR16[:]),
-			hex.EncodeToString(pcr16))
-	}
-
-	fmt.Printf("[verify] Pubkey binding verified via PCR16: %s attested in enclave.\n", info.SignerPubkey)
-	return nil
 }
 
 // --- Attestation key binding ---
@@ -290,8 +245,7 @@ func verifyAttestationKeyBinding(client *http.Client, baseURL string, attestResu
 		}
 	}
 	if allZero {
-		fmt.Println("[verify] appKeyHash is all zeros (attestation key not registered)")
-		return nil
+		return errAppKeyNotReady
 	}
 
 	info, err := fetchEnclaveInfo(client, baseURL)
@@ -387,6 +341,7 @@ type enclaveInfoResponse struct {
 	Version           string `json:"version"`
 	PreviousPCR0      string `json:"previous_pcr0"`
 	AttestationPubkey string `json:"attestation_pubkey,omitempty"`
+	Error             string `json:"error,omitempty"`
 }
 
 func fetchEnclaveInfo(client *http.Client, baseURL string) (*enclaveInfoResponse, error) {
@@ -411,6 +366,9 @@ func fetchEnclaveInfo(client *http.Client, baseURL string) (*enclaveInfoResponse
 	if err := json.NewDecoder(resp.Body).Decode(&info); err != nil {
 		return nil, fmt.Errorf("decode enclave info: %w", err)
 	}
+	if info.Error != "" {
+		return &info, fmt.Errorf("enclave init error: %s", info.Error)
+	}
 	return &info, nil
 }
 
@@ -423,6 +381,30 @@ func verifyHTTPClient(insecure bool) *http.Client {
 		Timeout:   30 * time.Second,
 		Transport: transport,
 	}
+}
+
+// shortErr returns a concise error string for retry logging.
+func shortErr(err error) string {
+	s := err.Error()
+	if strings.Contains(s, "TLS handshake timeout") {
+		return "TLS handshake timeout"
+	}
+	if strings.Contains(s, "connection refused") {
+		return "connection refused"
+	}
+	if strings.Contains(s, "i/o timeout") {
+		return "i/o timeout"
+	}
+	if errors.Is(err, errAppKeyNotReady) {
+		return "attestation key not yet registered"
+	}
+	if strings.Contains(s, "enclave init error:") {
+		return s
+	}
+	if len(s) > 60 {
+		return s[:60] + "..."
+	}
+	return s
 }
 
 func buildAndExtractPCR0(repoPath, version, region, nixImage string) (string, error) {

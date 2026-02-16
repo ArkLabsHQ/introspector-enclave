@@ -31,11 +31,12 @@ type EIFBuildConfig struct {
 
 // buildConfigJSON is the structure written to build-config.json for Nix to read.
 type buildConfigJSON struct {
-	Name    string             `json:"name"`
-	Version string             `json:"version"`
-	Region  string             `json:"region"`
-	Prefix  string             `json:"prefix"`
-	App     buildConfigAppJSON `json:"app"`
+	Name    string                 `json:"name"`
+	Version string                 `json:"version"`
+	Region  string                 `json:"region"`
+	Prefix  string                 `json:"prefix"`
+	App     buildConfigAppJSON     `json:"app"`
+	Secrets []buildConfigSecretJSON `json:"secrets"`
 }
 
 type buildConfigAppJSON struct {
@@ -46,8 +47,12 @@ type buildConfigAppJSON struct {
 	NixVendorHash  string            `json:"nix_vendor_hash"`
 	NixSubPackages []string          `json:"nix_sub_packages"`
 	BinaryName     string            `json:"binary_name"`
-	Port           int               `json:"port"`
 	Env            map[string]string `json:"env"`
+}
+
+type buildConfigSecretJSON struct {
+	Name   string `json:"name"`
+	EnvVar string `json:"env_var"`
 }
 
 func buildCmd() *cobra.Command {
@@ -120,6 +125,15 @@ func generateBuildConfig(cfg *Config, root string) error {
 	// Add APP_BINARY_NAME so start.sh and the supervisor can find the app.
 	resolvedEnv["APP_BINARY_NAME"] = cfg.App.BinaryName
 
+	// Convert secrets config.
+	var secrets []buildConfigSecretJSON
+	for _, s := range cfg.Secrets {
+		secrets = append(secrets, buildConfigSecretJSON{
+			Name:   s.Name,
+			EnvVar: s.EnvVar,
+		})
+	}
+
 	bc := buildConfigJSON{
 		Name:    cfg.Name,
 		Version: cfg.Version,
@@ -133,9 +147,9 @@ func generateBuildConfig(cfg *Config, root string) error {
 			NixVendorHash:  cfg.App.NixVendorHash,
 			NixSubPackages: cfg.App.NixSubPackages,
 			BinaryName:     cfg.App.BinaryName,
-			Port:           cfg.App.Port,
 			Env:            resolvedEnv,
 		},
+		Secrets: secrets,
 	}
 
 	data, err := json.MarshalIndent(bc, "", "  ")

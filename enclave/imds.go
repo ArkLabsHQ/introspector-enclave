@@ -119,6 +119,9 @@ func loadAWSConfigWithIMDS(ctx context.Context) (aws.Config, error) {
 		region = os.Getenv("AWS_REGION")
 	}
 	if region == "" {
+		region = os.Getenv("ENCLAVE_AWS_REGION")
+	}
+	if region == "" {
 		region = os.Getenv("INTROSPECTOR_AWS_REGION")
 	}
 	if region == "" {

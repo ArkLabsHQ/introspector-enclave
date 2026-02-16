@@ -31,18 +31,26 @@ type attestationDocument struct {
 	PCRs map[uint][]byte `cbor:"pcrs"`
 }
 
-// waitForSecretKeyFromKMS waits until the secret key is loaded from KMS.
-func waitForSecretKeyFromKMS(ctx context.Context) error {
+// waitForSecretsFromKMS waits until all configured secrets are loaded from KMS.
+func waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef) error {
 	interval := 5 * time.Second
-	log.Info("initializing secret key via KMS")
+	log.Infof("initializing %d secret(s) via KMS", len(secrets))
 
 	for {
-		if err := initializeOrLoadSecretKey(ctx); err == nil {
-			if strings.TrimSpace(os.Getenv("INTROSPECTOR_SECRET_KEY")) != "" {
-				return nil
+		allLoaded := true
+		for _, s := range secrets {
+			if err := initializeOrLoadSecret(ctx, s); err != nil {
+				log.WithError(err).Warnf("KMS operation failed for %s; retrying", s.Name)
+				allLoaded = false
+				break
 			}
-		} else {
-			log.WithError(err).Warn("KMS operation failed; retrying")
+			if strings.TrimSpace(os.Getenv(s.EnvVar)) == "" {
+				allLoaded = false
+				break
+			}
+		}
+		if allLoaded {
+			return nil
 		}
 
 		select {
@@ -53,11 +61,10 @@ func waitForSecretKeyFromKMS(ctx context.Context) error {
 	}
 }
 
-// initializeOrLoadSecretKey checks SSM for existing ciphertext. If not found,
-// generates a new key, encrypts with KMS, and stores in SSM.
+// initializeOrLoadSecret checks SSM for existing ciphertext for a secret.
+// If not found, generates 32 random bytes, encrypts with KMS, and stores in SSM.
 // If found, decrypts using KMS with attestation.
-// NOTE: KMS key policy must be configured EXTERNALLY with the PCR0 for decryption to work.
-func initializeOrLoadSecretKey(ctx context.Context) error {
+func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
 		return fmt.Errorf("load AWS config: %w", err)
@@ -66,7 +73,7 @@ func initializeOrLoadSecretKey(ctx context.Context) error {
 	ssmClient := ssm.NewFromConfig(awsCfg)
 	kmsClient := kms.NewFromConfig(awsCfg)
 
-	paramName := getSSMParamName()
+	paramName := getSecretSSMParamName(secret.Name)
 	keyID, err := getKMSKeyID(ctx, ssmClient)
 	if err != nil {
 		return fmt.Errorf("get KMS key ID: %w", err)
@@ -75,41 +82,41 @@ func initializeOrLoadSecretKey(ctx context.Context) error {
 		return fmt.Errorf("KMS key ID is empty")
 	}
 
-	// Check if ciphertext already exists in SSM
+	// Check if ciphertext already exists in SSM.
 	ciphertextB64, err := loadCiphertextFromSSM(ctx, ssmClient, paramName)
 	if err != nil {
 		return err
 	}
 
 	if ciphertextB64 == "" {
-		// No existing key - generate new one, encrypt, store
-		log.Info("no existing secret key found, generating new one")
-		return generateAndStoreNewKey(ctx, kmsClient, ssmClient, keyID, paramName)
+		// No existing secret — generate, encrypt, store.
+		log.Infof("no existing secret %q found, generating new one", secret.Name)
+		return generateAndStoreSecret(ctx, kmsClient, ssmClient, keyID, paramName, secret.EnvVar)
 	}
 
-	// Existing key found - decrypt it
-	log.Info("found existing secret key ciphertext, decrypting")
-	return decryptExistingKey(ctx, kmsClient, keyID, ciphertextB64)
+	// Existing secret found — decrypt it.
+	log.Infof("found existing secret %q ciphertext, decrypting", secret.Name)
+	return decryptExistingSecret(ctx, kmsClient, keyID, ciphertextB64, secret.EnvVar)
 }
 
-// generateAndStoreNewKey generates a new secp256k1 key, encrypts it with KMS,
-// extracts PCR0 from attestation (for external policy setup), and stores ciphertext in SSM.
-func generateAndStoreNewKey(ctx context.Context, kmsClient *kms.Client, ssmClient *ssm.Client, keyID, paramName string) error {
-	// Generate new secp256k1 private key (32 random bytes)
-	privateKey, err := generateSecp256k1Key()
+// generateAndStoreSecret generates 32 random bytes, encrypts with KMS,
+// extracts PCR0 from attestation, and stores ciphertext in SSM.
+func generateAndStoreSecret(ctx context.Context, kmsClient *kms.Client, ssmClient *ssm.Client, keyID, paramName, envVar string) error {
+	// Generate 32 random bytes.
+	secretBytes := make([]byte, 32)
+	if _, err := rand.Read(secretBytes); err != nil {
+		return fmt.Errorf("generate random bytes: %w", err)
+	}
+	log.Info("generated new 32-byte secret")
+
+	// Encrypt with KMS (no attestation needed for encrypt).
+	ciphertextB64, err := encryptWithKMS(ctx, kmsClient, keyID, secretBytes)
 	if err != nil {
 		return err
 	}
-	log.Info("generated new secp256k1 private key")
+	log.Info("encrypted secret with KMS")
 
-	// Encrypt with KMS (no attestation needed for encrypt)
-	ciphertextB64, err := encryptWithKMS(ctx, kmsClient, keyID, privateKey)
-	if err != nil {
-		return err
-	}
-	log.Info("encrypted private key with KMS")
-
-	// Get attestation document to extract PCR0
+	// Get attestation document to extract PCR0.
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
 		return fmt.Errorf("open nsm session: %w", err)
@@ -121,35 +128,30 @@ func generateAndStoreNewKey(ctx context.Context, kmsClient *kms.Client, ssmClien
 		return err
 	}
 
-	// Extract PCR0 from attestation and log it for external policy setup
+	// Extract PCR0 and log it for external policy setup.
 	pcr0, err := extractPCR0FromAttestation(attestationDoc)
 	if err != nil {
 		return err
 	}
 	log.Infof("PCR0 for KMS policy (apply externally): %s", pcr0)
 
-	// NOTE: KMS key policy should be applied EXTERNALLY using this PCR0.
-	// The enclave does not have permissions to modify the KMS key policy.
-	// Use: aws kms put-key-policy --key-id <KEY_ID> --policy-name default --policy file://policy.json
-	// where policy.json contains a condition for kms:RecipientAttestation:PCR0 = <PCR0>
-
-	// Store ciphertext in SSM
+	// Store ciphertext in SSM.
 	if err := storeCiphertextInSSM(ctx, ssmClient, paramName, ciphertextB64); err != nil {
 		return err
 	}
 
-	// Set the secret key in environment
-	secretHex := hex.EncodeToString(privateKey)
-	if err := os.Setenv("INTROSPECTOR_SECRET_KEY", secretHex); err != nil {
-		return fmt.Errorf("set INTROSPECTOR_SECRET_KEY: %w", err)
+	// Set the secret in environment as hex.
+	secretHex := hex.EncodeToString(secretBytes)
+	if err := os.Setenv(envVar, secretHex); err != nil {
+		return fmt.Errorf("set %s: %w", envVar, err)
 	}
 
-	log.Info("successfully initialized new secret key")
+	log.Infof("successfully initialized new secret (env=%s)", envVar)
 	return nil
 }
 
-// decryptExistingKey decrypts the ciphertext from SSM using KMS with attestation.
-func decryptExistingKey(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64 string) error {
+// decryptExistingSecret decrypts the ciphertext from SSM using KMS with attestation.
+func decryptExistingSecret(ctx context.Context, kmsClient *kms.Client, keyID, ciphertextB64, envVar string) error {
 	ciphertext, err := base64.StdEncoding.DecodeString(ciphertextB64)
 	if err != nil {
 		return fmt.Errorf("decode ciphertext: %w", err)
@@ -189,16 +191,13 @@ func decryptExistingKey(ctx context.Context, kmsClient *kms.Client, keyID, ciphe
 		return fmt.Errorf("decrypt CiphertextForRecipient: %w", err)
 	}
 
-	secretHex, err := normalizeSecretKey(plaintext)
-	if err != nil {
-		return err
+	secretHex := normalizeSecretHex(plaintext)
+
+	if err := os.Setenv(envVar, secretHex); err != nil {
+		return fmt.Errorf("set %s: %w", envVar, err)
 	}
 
-	if err := os.Setenv("INTROSPECTOR_SECRET_KEY", secretHex); err != nil {
-		return fmt.Errorf("set INTROSPECTOR_SECRET_KEY: %w", err)
-	}
-
-	log.Info("successfully decrypted existing secret key")
+	log.Infof("successfully decrypted existing secret (env=%s)", envVar)
 	return nil
 }
 
@@ -262,15 +261,6 @@ func extractPCR0FromAttestation(attestationDoc []byte) (string, error) {
 	return hex.EncodeToString(pcr0), nil
 }
 
-// generateSecp256k1Key generates a random 32-byte secp256k1 private key.
-func generateSecp256k1Key() ([]byte, error) {
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		return nil, fmt.Errorf("generate random bytes: %w", err)
-	}
-	return key, nil
-}
-
 // encryptWithKMS encrypts plaintext using KMS and returns base64-encoded ciphertext.
 func encryptWithKMS(ctx context.Context, kmsClient *kms.Client, keyID string, plaintext []byte) (string, error) {
 	out, err := kmsClient.Encrypt(ctx, &kms.EncryptInput{
@@ -321,29 +311,27 @@ func loadCiphertextFromSSM(ctx context.Context, ssmClient *ssm.Client, paramName
 	return value, nil
 }
 
-// getSSMParamName returns the SSM parameter name for storing the secret key ciphertext.
-func getSSMParamName() string {
-	if paramName := strings.TrimSpace(os.Getenv("INTROSPECTOR_SECRET_KEY_CIPHERTEXT_PARAM")); paramName != "" {
-		return paramName
-	}
-	deployment := strings.TrimSpace(os.Getenv("INTROSPECTOR_DEPLOYMENT"))
-	if deployment == "" {
-		deployment = "dev"
-	}
-	return fmt.Sprintf("/%s/NitroIntrospector/SecretKeyCiphertext", deployment)
+// getSecretSSMParamName returns the SSM parameter name for a secret's ciphertext.
+// Format: /{deployment}/{appName}/{secretName}/Ciphertext
+func getSecretSSMParamName(secretName string) string {
+	deployment := getDeployment()
+	appName := getAppName()
+	return fmt.Sprintf("/%s/%s/%s/Ciphertext", deployment, appName, secretName)
 }
 
 // getKMSKeyID returns the KMS key ID from environment or SSM.
 func getKMSKeyID(ctx context.Context, ssmClient *ssm.Client) (string, error) {
+	// Check new env var first, then legacy.
+	if keyID := strings.TrimSpace(os.Getenv("ENCLAVE_KMS_KEY_ID")); keyID != "" {
+		return keyID, nil
+	}
 	if keyID := strings.TrimSpace(os.Getenv("INTROSPECTOR_KMS_KEY_ID")); keyID != "" {
 		return keyID, nil
 	}
-	// Read from SSM parameter
-	deployment := strings.TrimSpace(os.Getenv("INTROSPECTOR_DEPLOYMENT"))
-	if deployment == "" {
-		deployment = "dev"
-	}
-	paramName := fmt.Sprintf("/%s/NitroIntrospector/KMSKeyID", deployment)
+	// Read from SSM parameter.
+	deployment := getDeployment()
+	appName := getAppName()
+	paramName := fmt.Sprintf("/%s/%s/KMSKeyID", deployment, appName)
 	out, err := ssmClient.GetParameter(ctx, &ssm.GetParameterInput{
 		Name:           aws.String(paramName),
 		WithDecryption: aws.Bool(false),
@@ -357,13 +345,14 @@ func getKMSKeyID(ctx context.Context, ssmClient *ssm.Client) (string, error) {
 	return strings.TrimSpace(*out.Parameter.Value), nil
 }
 
-// normalizeSecretKey normalizes the secret key to a hex string.
-func normalizeSecretKey(plaintext []byte) (string, error) {
+// normalizeSecretHex normalizes the secret to a hex string.
+func normalizeSecretHex(plaintext []byte) string {
 	candidate := strings.TrimSpace(string(plaintext))
 	if len(candidate) == 64 {
 		if _, err := hex.DecodeString(candidate); err == nil {
-			return candidate, nil
+			return candidate
 		}
 	}
-	return hex.EncodeToString(plaintext), nil
+	return hex.EncodeToString(plaintext)
 }
+

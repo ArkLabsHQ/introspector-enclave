@@ -5,7 +5,7 @@ set -e
 set -x
 
 VSOCK_SOCKET="${GVPROXY_SOCKET:-/tmp/network.sock}"
-FORWARD_PORTS="${GVPROXY_FORWARD_PORTS:-${INTROSPECTOR_PORT:-7073}}"
+FORWARD_PORTS="${GVPROXY_FORWARD_PORTS:-${ENCLAVE_PORT:-7073}}"
 
 setup_forward() {
   local_port=$1
