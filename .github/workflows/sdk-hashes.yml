@@ -1,0 +1,72 @@
+name: Verify SDK Hashes
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  verify-hashes:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: cachix/install-nix-action@v27
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Compute source hash
+        id: source
+        run: |
+          REV="${GITHUB_REF_NAME}"
+          HASH=$(nix hash to-sri sha256:$(nix-prefetch-url --unpack --type sha256 \
+            "https://github.com/${{ github.repository }}/archive/${REV}.tar.gz" 2>/dev/null))
+          echo "rev=${REV}" >> "$GITHUB_OUTPUT"
+          echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
+          echo "Source hash for ${REV}: ${HASH}"
+
+      - name: Verify sdk-hashes.json matches
+        run: |
+          if [ ! -f sdk-hashes.json ]; then
+            echo "::warning::sdk-hashes.json not found — skipping comparison"
+            exit 0
+          fi
+          FILE_REV=$(jq -r '.rev' sdk-hashes.json)
+          FILE_HASH=$(jq -r '.hash' sdk-hashes.json)
+          EXPECTED_HASH="${{ steps.source.outputs.hash }}"
+          TAG="${{ steps.source.outputs.rev }}"
+
+          # Only compare if sdk-hashes.json claims to be for this tag.
+          if [ "$FILE_REV" = "$TAG" ]; then
+            if [ "$FILE_HASH" != "$EXPECTED_HASH" ]; then
+              echo "::error::Source hash mismatch!"
+              echo "  sdk-hashes.json: ${FILE_HASH}"
+              echo "  computed:        ${EXPECTED_HASH}"
+              exit 1
+            fi
+            echo "Source hash matches."
+          else
+            echo "sdk-hashes.json is for ${FILE_REV}, not ${TAG} — skipping hash comparison."
+          fi
+
+      - name: Build enclave-supervisor
+        run: |
+          cd sdk
+          nix build --impure \
+            --extra-experimental-features 'nix-command flakes' \
+            --expr "
+              let pkgs = import <nixpkgs> {};
+              in pkgs.buildGoModule {
+                pname = \"enclave-supervisor\";
+                version = \"${{ steps.source.outputs.rev }}\";
+                src = ./.;
+                subPackages = [\"cmd/enclave-supervisor\"];
+                vendorHash = \"$(jq -r '.vendor_hash' ../sdk-hashes.json 2>/dev/null || echo '')\";
+                env.CGO_ENABLED = \"0\";
+                buildFlags = [\"-trimpath\"];
+                tags = [\"netgo\"];
+                doCheck = false;
+              }
+            "
+          echo "enclave-supervisor built successfully."

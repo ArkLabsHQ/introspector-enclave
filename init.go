@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/spf13/cobra"
 )
@@ -19,10 +20,20 @@ prefix: dev                      # Deployment prefix (stack = {prefix}Nitro{Name
 instance_type: m6i.xlarge        # EC2 instance type
 nix_image: nixos/nix:2.24.9      # Docker image for reproducible builds
 
+# SDK coordinates for the enclave supervisor binary.
+# The supervisor handles attestation, secrets, PCR extension, and signing
+# middleware automatically. Your app is a plain HTTP server with zero SDK imports.
+sdk:
+  rev: ""                        # SDK git commit SHA (required)
+  hash: ""                       # Nix source hash: nix-prefetch-url --unpack (required)
+  vendor_hash: ""                # Go vendor hash (required)
+
 app:
   source: nix                    # "nix" = fetch from GitHub via Nix
 
-  # GitHub coordinates for the app to run inside the enclave
+  # GitHub coordinates for the app to run inside the enclave.
+  # Your app is a normal Go HTTP server that listens on ENCLAVE_APP_PORT (default 7074).
+  # Secrets are passed as environment variables. No SDK imports needed.
   nix_owner: ""                  # GitHub owner (required)
   nix_repo: ""                   # GitHub repo name (required)
   nix_rev: ""                    # Git commit SHA (required)
@@ -73,7 +84,20 @@ func runInit(cmd *cobra.Command, args []string) error {
 		if err := os.MkdirAll(enclaveDir, 0755); err != nil {
 			return fmt.Errorf("create enclave/ directory: %w", err)
 		}
-		if err := os.WriteFile(cfgPath, []byte(configTemplate), 0644); err != nil {
+		// Substitute SDK coordinates if baked in via ldflags (release builds).
+		cfg := configTemplate
+		if sdkRev != "" {
+			cfg = strings.Replace(cfg,
+				`  rev: ""                        # SDK git commit SHA (required)`,
+				fmt.Sprintf(`  rev: "%s"`, sdkRev), 1)
+			cfg = strings.Replace(cfg,
+				`  hash: ""                       # Nix source hash: nix-prefetch-url --unpack (required)`,
+				fmt.Sprintf(`  hash: "%s"`, sdkHash), 1)
+			cfg = strings.Replace(cfg,
+				`  vendor_hash: ""                # Go vendor hash (required)`,
+				fmt.Sprintf(`  vendor_hash: "%s"`, sdkVendorHash), 1)
+		}
+		if err := os.WriteFile(cfgPath, []byte(cfg), 0644); err != nil {
 			return fmt.Errorf("write %s: %w", configFile, err)
 		}
 		fmt.Printf("Created %s\n", configFile)
@@ -91,7 +115,10 @@ func runInit(cmd *cobra.Command, args []string) error {
 		}
 
 		fmt.Println()
-		fmt.Println("Edit enclave/enclave.yaml with your app details, then run 'enclave init' again to validate.")
+		fmt.Println("Edit enclave/enclave.yaml with your app and SDK details.")
+		fmt.Println("Your app is a plain Go HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
+		fmt.Println("No SDK imports needed — the supervisor handles attestation automatically.")
+		fmt.Println("Then run 'enclave init' again to validate.")
 		return nil
 	}
 
@@ -123,7 +150,15 @@ func runInit(cmd *cobra.Command, args []string) error {
 			errors = append(errors, "'app.nix_vendor_hash' is required")
 		}
 	}
-
+	if cfg.SDK.Rev == "" {
+		errors = append(errors, "'sdk.rev' is required")
+	}
+	if cfg.SDK.Hash == "" {
+		errors = append(errors, "'sdk.hash' is required")
+	}
+	if cfg.SDK.VendorHash == "" {
+		errors = append(errors, "'sdk.vendor_hash' is required")
+	}
 	if len(errors) > 0 {
 		fmt.Println("Validation errors:")
 		for _, e := range errors {
@@ -141,6 +176,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Printf("  Account:     %s\n", cfg.Account)
 	fmt.Printf("  Prefix:      %s\n", cfg.Prefix)
 	fmt.Printf("  Instance:    %s\n", cfg.InstanceType)
+	fmt.Println()
+	fmt.Printf("  SDK Rev:     %.12s\n", cfg.SDK.Rev)
 	fmt.Println()
 	fmt.Printf("  App Source:  %s\n", cfg.App.Source)
 	fmt.Printf("  App Repo:    %s/%s\n", cfg.App.NixOwner, cfg.App.NixRepo)

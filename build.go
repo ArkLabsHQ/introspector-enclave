@@ -37,6 +37,7 @@ type buildConfigJSON struct {
 	Prefix  string                 `json:"prefix"`
 	App     buildConfigAppJSON     `json:"app"`
 	Secrets []buildConfigSecretJSON `json:"secrets"`
+	SDK     buildConfigSDKJSON     `json:"sdk"`
 }
 
 type buildConfigAppJSON struct {
@@ -55,6 +56,12 @@ type buildConfigSecretJSON struct {
 	EnvVar string `json:"env_var"`
 }
 
+type buildConfigSDKJSON struct {
+	Rev        string `json:"rev"`
+	Hash       string `json:"hash"`
+	VendorHash string `json:"vendor_hash"`
+}
+
 func buildCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "build",
@@ -69,6 +76,9 @@ func buildCmd() *cobra.Command {
 func runBuild(cmd *cobra.Command, args []string) error {
 	cfg, err := loadConfig()
 	if err != nil {
+		return err
+	}
+	if err := cfg.validateSDK(); err != nil {
 		return err
 	}
 
@@ -150,6 +160,11 @@ func generateBuildConfig(cfg *Config, root string) error {
 			Env:            resolvedEnv,
 		},
 		Secrets: secrets,
+		SDK: buildConfigSDKJSON{
+			Rev:        cfg.SDK.Rev,
+			Hash:       cfg.SDK.Hash,
+			VendorHash: cfg.SDK.VendorHash,
+		},
 	}
 
 	data, err := json.MarshalIndent(bc, "", "  ")
