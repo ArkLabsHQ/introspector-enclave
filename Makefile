@@ -26,8 +26,10 @@ build: ## Build the enclave CLI with SDK hashes baked in
 
 sdk-hashes: ## Compute SDK nix hashes for REV (default: latest tag)
 	@echo "Computing hashes for $(REV)..."
-	@SOURCE_HASH=$$(nix hash to-sri sha256:$$(nix-prefetch-url --unpack --type sha256 \
-	  "https://github.com/$(REPO_OWNER)/$(REPO_NAME)/archive/$(REV).tar.gz" 2>/dev/null)) && \
+	@TMPDIR=$$(mktemp -d) && \
+	git archive --format=tar.gz --prefix=source/ $(REV) | tar xz -C "$$TMPDIR" && \
+	SOURCE_HASH=$$(nix hash path "$$TMPDIR/source") && \
+	rm -rf "$$TMPDIR" && \
 	echo '{"rev":"$(REV)","hash":"'$$SOURCE_HASH'","vendor_hash":""}' | jq '.' > $(HASHES_FILE) && \
 	echo "Source hash: $$SOURCE_HASH" && \
 	echo "" && \

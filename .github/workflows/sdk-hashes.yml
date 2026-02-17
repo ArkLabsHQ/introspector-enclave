@@ -20,8 +20,9 @@ jobs:
         id: source
         run: |
           REV="${GITHUB_REF_NAME}"
-          HASH=$(nix hash to-sri sha256:$(nix-prefetch-url --unpack --type sha256 \
-            "https://github.com/${{ github.repository }}/archive/${REV}.tar.gz" 2>/dev/null))
+          RAW=$(nix-prefetch-url --unpack --type sha256 \
+            "https://github.com/${{ github.repository }}/archive/${REV}.tar.gz")
+          HASH=$(nix hash convert --hash-algo sha256 --to sri "$RAW")
           echo "rev=${REV}" >> "$GITHUB_OUTPUT"
           echo "hash=${HASH}" >> "$GITHUB_OUTPUT"
           echo "Source hash for ${REV}: ${HASH}"
