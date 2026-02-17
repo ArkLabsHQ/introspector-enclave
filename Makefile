@@ -16,13 +16,16 @@ LDFLAGS := -X $(MODULE).sdkRev=$(SDK_REV) \
            -X $(MODULE).sdkHash=$(SDK_HASH) \
            -X $(MODULE).sdkVendorHash=$(SDK_VENDOR_HASH)
 
-.PHONY: build sdk-hashes help
+.PHONY: build install sdk-hashes vendor-hash help
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-18s %s\n", $$1, $$2}'
 
 build: ## Build the enclave CLI with SDK hashes baked in
 	go build -ldflags '$(LDFLAGS)' -o enclave-cli ./cmd/enclave
+
+install: ## Install the enclave CLI to $GOPATH/bin with SDK hashes baked in
+	go install -ldflags '$(LDFLAGS)' ./cmd/enclave
 
 sdk-hashes: ## Compute SDK nix hashes for REV (default: latest tag)
 	@echo "Computing hashes for $(REV)..."
