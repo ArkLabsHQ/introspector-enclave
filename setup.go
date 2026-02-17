@@ -1,0 +1,369 @@
+package introspector_enclave
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+
+	"github.com/spf13/cobra"
+)
+
+func setupCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "setup",
+		Short: "Auto-populate app nix hashes in enclave.yaml",
+		Long: `Detects the GitHub owner/repo from git remote, computes nix_rev,
+nix_hash, and nix_vendor_hash, and updates enclave/enclave.yaml.
+
+By default, runs hash computation inside a Docker container (same nixos
+image as 'enclave build'). Use --local to use the host nix installation.
+
+All hashes are computed from the local git repo — no fetch from GitHub.`,
+		RunE: runSetup,
+	}
+	cmd.Flags().Bool("local", false, "Use local Nix instead of Docker")
+	return cmd
+}
+
+func runSetup(cmd *cobra.Command, args []string) error {
+	root, err := findRepoRoot()
+	if err != nil {
+		return err
+	}
+
+	local, _ := cmd.Flags().GetBool("local")
+
+	// 1. Detect owner/repo from git remote.
+	owner, repo, err := detectGitRemote(root)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[setup] Detected repo: %s/%s\n", owner, repo)
+
+	// 2. Get HEAD commit SHA.
+	rev, err := gitRevParseHEAD(root)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("[setup] HEAD commit: %s\n", rev)
+
+	// 3. Load config for nix image and sub-packages.
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	subPackages := cfg.App.NixSubPackages
+	if len(subPackages) == 0 {
+		subPackages = []string{"."}
+	}
+
+	var nixHash, vendorHash string
+	var vendorErr error
+
+	if local {
+		// Check nix is available.
+		if _, err := exec.LookPath("nix"); err != nil {
+			return fmt.Errorf("nix is required but not found in PATH; install from https://nixos.org")
+		}
+
+		// 3. Compute nix source hash locally.
+		fmt.Println("[setup] Computing nix source hash (local)...")
+		nixHash, err = computeNixHash(root, rev)
+		if err != nil {
+			return err
+		}
+		fmt.Printf("[setup] nix_hash: %s\n", nixHash)
+
+		// 4. Compute vendor hash via trial nix build.
+		fmt.Println("[setup] Computing vendor hash (local trial nix build)...")
+		vendorHash, vendorErr = computeVendorHash(root, subPackages)
+	} else {
+		// Docker mode: run both hash computations inside the nix container.
+		nixImage := cfg.NixImage
+		if nixImage == "" {
+			nixImage = DefaultNixImage
+		}
+
+		fmt.Printf("[setup] Computing hashes in Docker (%s)...\n", nixImage)
+		nixHash, vendorHash, vendorErr = computeHashesDocker(root, rev, subPackages, nixImage)
+		if nixHash == "" && vendorErr != nil {
+			return vendorErr
+		}
+		if nixHash != "" {
+			fmt.Printf("[setup] nix_hash: %s\n", nixHash)
+		}
+	}
+
+	if vendorErr != nil {
+		fmt.Printf("[setup] Warning: could not compute vendor hash: %v\n", vendorErr)
+		fmt.Println("[setup] Will update other fields; you'll need to fill nix_vendor_hash manually.")
+	} else {
+		fmt.Printf("[setup] nix_vendor_hash: %s\n", vendorHash)
+	}
+
+	// 5. Update enclave.yaml preserving comments.
+	cfgPath := filepath.Join(root, configFile)
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", configFile, err)
+	}
+
+	content := string(data)
+	content = replaceYAMLValue(content, "nix_owner", owner)
+	content = replaceYAMLValue(content, "nix_repo", repo)
+	content = replaceYAMLValue(content, "nix_rev", rev)
+	if nixHash != "" {
+		content = replaceYAMLValue(content, "nix_hash", nixHash)
+	}
+	if vendorHash != "" {
+		content = replaceYAMLValue(content, "nix_vendor_hash", vendorHash)
+	}
+
+	if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+		return fmt.Errorf("write %s: %w", configFile, err)
+	}
+
+	fmt.Println()
+	fmt.Printf("[setup] Updated %s\n", configFile)
+	if vendorHash == "" {
+		fmt.Println()
+		fmt.Println("Warning: nix_vendor_hash is still empty.")
+		fmt.Println("To compute it manually:")
+		fmt.Println("  1. Run 'nix build' with vendorHash = \"\" in your flake")
+		fmt.Println("  2. Copy the 'got: sha256-...' hash from the error output")
+		fmt.Println("  3. Paste it as nix_vendor_hash in enclave/enclave.yaml")
+	}
+	fmt.Println()
+	fmt.Println("Next: enclave build")
+	return nil
+}
+
+// computeHashesDocker runs nix hash + vendor hash computation inside a Docker
+// container using the same nixos image as 'enclave build'.
+// Results are written to .enclave-setup-result in the mounted directory.
+func computeHashesDocker(root, rev string, subPackages []string, nixImage string) (nixHash, vendorHash string, err error) {
+	// Build sub-packages as Nix list: [ "." "cmd/foo" ]
+	var nixPkgs []string
+	for _, p := range subPackages {
+		nixPkgs = append(nixPkgs, fmt.Sprintf(`\"%s\"`, p))
+	}
+	nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
+
+	resultFile := ".enclave-setup-result"
+
+	// Shell script that runs inside the container.
+	// Writes results to a file in the mounted volume so the host can read them.
+	script := fmt.Sprintf(`set -e
+git config --global --add safe.directory /src
+
+# Compute source hash
+TMPDIR=$(mktemp -d)
+git archive --format=tar.gz --prefix=source/ %s | tar xz -C "$TMPDIR"
+SOURCE_HASH=$(nix hash path "$TMPDIR/source")
+rm -rf "$TMPDIR"
+echo "nix_hash=$SOURCE_HASH" > /src/%s
+
+# Compute vendor hash via trial build
+VENDOR_OUTPUT=$(nix build --impure --no-link \
+  --extra-experimental-features 'nix-command flakes' \
+  --expr 'let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
+    pname = "app"; version = "dev"; src = ./.;
+    subPackages = %s; vendorHash = "";
+    env.CGO_ENABLED = "0"; doCheck = false;
+  }' 2>&1 || true)
+VENDOR_HASH=$(echo "$VENDOR_OUTPUT" | grep 'got:' | awk '{print $2}')
+if [ -n "$VENDOR_HASH" ]; then
+  echo "vendor_hash=$VENDOR_HASH" >> /src/%s
+else
+  echo "vendor_err=Could not extract vendor hash" >> /src/%s
+fi
+`, rev, resultFile, nixSubPkgs, resultFile, resultFile)
+
+	// Run inside Docker using the existing runContainer function.
+	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
+		return "", "", fmt.Errorf("docker setup failed: %w", err)
+	}
+
+	// Read results from the file written by the container.
+	resultPath := filepath.Join(root, resultFile)
+	defer os.Remove(resultPath)
+
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		return "", "", fmt.Errorf("read setup results: %w", err)
+	}
+
+	results := string(data)
+	for _, line := range strings.Split(results, "\n") {
+		if strings.HasPrefix(line, "nix_hash=") {
+			nixHash = strings.TrimPrefix(line, "nix_hash=")
+		}
+		if strings.HasPrefix(line, "vendor_hash=") {
+			vendorHash = strings.TrimPrefix(line, "vendor_hash=")
+		}
+	}
+
+	if nixHash == "" {
+		return "", "", fmt.Errorf("could not compute nix_hash in Docker container")
+	}
+
+	if vendorHash == "" {
+		return nixHash, "", fmt.Errorf("could not extract vendor hash from Docker trial build")
+	}
+
+	return nixHash, vendorHash, nil
+}
+
+// detectGitRemote parses the origin remote URL to extract GitHub owner and repo.
+func detectGitRemote(root string) (owner, repo string, err error) {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return "", "", fmt.Errorf("cannot detect git remote: %w\nMake sure you are in a git repo with an 'origin' remote.", err)
+	}
+
+	remoteURL := strings.TrimSpace(string(out))
+	return parseGitRemoteURL(remoteURL)
+}
+
+// parseGitRemoteURL extracts owner/repo from SSH or HTTPS git URLs.
+func parseGitRemoteURL(rawURL string) (owner, repo string, err error) {
+	// SSH: git@github.com:Owner/Repo.git
+	if strings.HasPrefix(rawURL, "git@") {
+		parts := strings.SplitN(rawURL, ":", 2)
+		if len(parts) != 2 {
+			return "", "", fmt.Errorf("cannot parse SSH remote URL: %s", rawURL)
+		}
+		path := strings.TrimSuffix(parts[1], ".git")
+		segments := strings.SplitN(path, "/", 2)
+		if len(segments) != 2 {
+			return "", "", fmt.Errorf("cannot parse owner/repo from remote URL: %s", rawURL)
+		}
+		return segments[0], segments[1], nil
+	}
+
+	// HTTPS: https://github.com/Owner/Repo.git
+	trimmed := rawURL
+	trimmed = strings.TrimPrefix(trimmed, "https://")
+	trimmed = strings.TrimPrefix(trimmed, "http://")
+	trimmed = strings.TrimSuffix(trimmed, ".git")
+
+	// Split on / — expect host/owner/repo
+	parts := strings.Split(trimmed, "/")
+	if len(parts) < 3 {
+		return "", "", fmt.Errorf("cannot parse owner/repo from remote URL: %s", rawURL)
+	}
+	// parts[0] = "github.com", parts[1] = owner, parts[2] = repo
+	return parts[1], parts[2], nil
+}
+
+// gitRevParseHEAD returns the full SHA of HEAD.
+func gitRevParseHEAD(root string) (string, error) {
+	cmd := exec.Command("git", "rev-parse", "HEAD")
+	cmd.Dir = root
+	out, err := cmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("git rev-parse HEAD: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// computeNixHash computes the SRI hash that matches Nix's fetchFromGitHub
+// by creating a git archive locally and hashing it with nix hash path.
+func computeNixHash(root string, rev string) (string, error) {
+	tmpDir, err := os.MkdirTemp("", "enclave-setup-*")
+	if err != nil {
+		return "", fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// git archive --format=tar.gz --prefix=source/ HEAD | tar xz -C tmpDir
+	archiveCmd := exec.Command("git", "archive", "--format=tar.gz", "--prefix=source/", rev)
+	archiveCmd.Dir = root
+
+	tarCmd := exec.Command("tar", "xz", "-C", tmpDir)
+	tarCmd.Stdin, err = archiveCmd.StdoutPipe()
+	if err != nil {
+		return "", fmt.Errorf("pipe setup: %w", err)
+	}
+
+	if err := tarCmd.Start(); err != nil {
+		return "", fmt.Errorf("start tar: %w", err)
+	}
+	if err := archiveCmd.Run(); err != nil {
+		return "", fmt.Errorf("git archive: %w", err)
+	}
+	if err := tarCmd.Wait(); err != nil {
+		return "", fmt.Errorf("tar extract: %w", err)
+	}
+
+	// nix hash path tmpDir/source
+	hashCmd := exec.Command("nix", "hash", "path", filepath.Join(tmpDir, "source"))
+	out, err := hashCmd.Output()
+	if err != nil {
+		return "", fmt.Errorf("nix hash path: %w", err)
+	}
+
+	return strings.TrimSpace(string(out)), nil
+}
+
+// computeVendorHash runs a trial nix build with empty vendorHash to discover
+// the expected Go vendor hash. It parses the "got:" line from the error output.
+func computeVendorHash(root string, subPackages []string) (string, error) {
+	// Build the subPackages as a Nix list string: [ "." "cmd/foo" ]
+	var nixPkgs []string
+	for _, p := range subPackages {
+		nixPkgs = append(nixPkgs, fmt.Sprintf("%q", p))
+	}
+	nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
+
+	expr := fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
+  pname = "app"; version = "dev"; src = ./.;
+  subPackages = %s; vendorHash = "";
+  env.CGO_ENABLED = "0"; doCheck = false;
+}`, nixSubPkgs)
+
+	cmd := exec.Command("nix", "build",
+		"--impure",
+		"--no-link",
+		"--extra-experimental-features", "nix-command flakes",
+		"--expr", expr,
+	)
+	cmd.Dir = root
+
+	// We expect this to fail — we want the stderr output with the expected hash.
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	cmd.Stdout = os.Stdout
+
+	_ = cmd.Run() // intentionally ignore error — we expect failure
+
+	// Parse "got:    sha256-..." from output.
+	output := stderr.String()
+	re := regexp.MustCompile(`got:\s+(sha256-\S+)`)
+	matches := re.FindStringSubmatch(output)
+	if len(matches) < 2 {
+		// Print stderr so user can debug.
+		fmt.Fprintf(os.Stderr, "\n[setup] Trial build output:\n%s\n", output)
+		return "", fmt.Errorf("could not extract vendor hash from trial build output.\nRun a manual nix build with vendorHash = \"\" and look for the 'got:' line.")
+	}
+
+	return matches[1], nil
+}
+
+// replaceYAMLValue replaces the value of a YAML key in-place, preserving
+// the rest of the line (indentation, inline comments).
+// Matches patterns like:  nix_owner: ""  or  nix_owner: "some-value"
+// and replaces with:      nix_owner: "<newValue>"
+func replaceYAMLValue(content, key, newValue string) string {
+	// Match:  key: "anything"  (with optional surrounding whitespace)
+	// Also match:  key: ""  (empty value)
+	pattern := regexp.MustCompile(`(` + regexp.QuoteMeta(key) + `:\s*)"[^"]*"`)
+	return pattern.ReplaceAllString(content, `${1}"`+newValue+`"`)
+}

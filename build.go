@@ -181,6 +181,15 @@ func generateBuildConfig(cfg *Config, root string) error {
 	return nil
 }
 
+// ensureGitTracked stages files with `git add --intent-to-add` so Nix flakes
+// can see them. This is a no-op for already tracked files.
+func ensureGitTracked(root string, paths ...string) {
+	args := append([]string{"add", "--intent-to-add", "--"}, paths...)
+	cmd := exec.Command("git", args...)
+	cmd.Dir = root
+	_ = cmd.Run() // best-effort; ignore errors (e.g. no git repo)
+}
+
 // BuildEIF builds the enclave image (EIF) reproducibly using Docker + Nix.
 func BuildEIF(cfg EIFBuildConfig, root string) (*PCRValues, error) {
 	nixImage := cfg.NixImage
@@ -200,7 +209,10 @@ func BuildEIF(cfg EIFBuildConfig, root string) (*PCRValues, error) {
 	fmt.Printf("[build] Building EIF with %s (version=%s, region=%s, prefix=%s)\n",
 		nixImage, cfg.Version, cfg.Region, cfg.Prefix)
 
-	// 2. Run Nix build inside Docker container.
+	// 2. Ensure Nix-visible files are tracked by git (flakes only see tracked files).
+	ensureGitTracked(root, "flake.nix", "build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
+
+	// 3. Run Nix build inside Docker container.
 	// build-config.json is already at the repo root, mounted into /src.
 	nixCmd := "git config --global --add safe.directory /src && " +
 		"nix build --impure --extra-experimental-features 'nix-command flakes' .#eif && " +
@@ -255,13 +267,16 @@ func BuildEIFLocal(cfg *Config, root string) (*PCRValues, error) {
 	fmt.Printf("[build] Building EIF locally with nix (version=%s, region=%s, prefix=%s)\n",
 		cfg.Version, cfg.Region, cfg.Prefix)
 
-	// 2. Run nix build locally.
+	// 2. Ensure Nix-visible files are tracked by git (flakes only see tracked files).
+	ensureGitTracked(root, "flake.nix", "build-config.json", "enclave/start.sh", "enclave/enclave.yaml")
+
 	configPath := filepath.Join(root, "build-config.json")
 	absConfigPath, err := filepath.Abs(configPath)
 	if err != nil {
 		return nil, fmt.Errorf("resolve build-config.json path: %w", err)
 	}
 
+	// 3. Run nix build locally.
 	nixCmd := exec.Command("nix", "build",
 		"--impure",
 		"--extra-experimental-features", "nix-command flakes",

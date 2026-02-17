@@ -88,9 +88,6 @@ func loadConfig() (*Config, error) {
 	if cfg.Region == "" {
 		return nil, fmt.Errorf("%s: 'region' is required", configFile)
 	}
-	if cfg.Account == "" {
-		return nil, fmt.Errorf("%s: 'account' is required", configFile)
-	}
 	// Validate secrets.
 	seen := make(map[string]bool)
 	for i, s := range cfg.Secrets {
@@ -106,6 +103,15 @@ func loadConfig() (*Config, error) {
 		seen[s.Name] = true
 	}
 	return &cfg, nil
+}
+
+// validateAccount checks that the AWS account ID is present. Only needed for
+// commands that interact with AWS (deploy, destroy, status, lock).
+func (c *Config) validateAccount() error {
+	if c.Account == "" {
+		return fmt.Errorf("%s: 'account' is required", configFile)
+	}
+	return nil
 }
 
 // validateSDK checks that SDK coordinates are present. Only needed for commands
