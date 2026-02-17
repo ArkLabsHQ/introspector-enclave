@@ -202,20 +202,22 @@ enclave deploy
 SDK hashes are computed per release tag and baked into CLI builds via ldflags. This lets `enclave init` auto-populate the `sdk:` section.
 
 ```sh
-# 1. Compute source hash (from local git tree, no network auth needed)
-make sdk-hashes REV=HEAD
+# 1. Tag the release
+git tag v1.0.0
 
-# 2. Compute vendor hash (runs a test Nix build to get the expected hash)
+# 2. Compute source hash (from local git tree, no network auth needed)
+make sdk-hashes REV=v1.0.0
+
+# 3. Compute vendor hash (runs a test Nix build to get the expected hash)
 make vendor-hash
 
-# 3. Commit the hashes
+# 4. Commit the hashes and push
 git add sdk-hashes.json
-git commit -m "adding nix hashes"
-
-# 4. Tag the release and push
-git tag v1.0.0
+git commit -m "sdk hashes for v1.0.0"
 git push && git push --tags
 ```
+
+> **Note:** The tag points to the commit *before* `sdk-hashes.json` is added. This is correct — the tag identifies the source code being hashed, and `sdk-hashes.json` is a build artifact that references it.
 
 ### Makefile Targets
 
