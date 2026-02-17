@@ -12,17 +12,18 @@ import (
 const configFile = "enclave/enclave.yaml"
 
 type Config struct {
-	Name         string         `yaml:"name"`
-	Version      string         `yaml:"version"`
-	Region       string         `yaml:"region"`
-	Account      string         `yaml:"account"`
-	Prefix       string         `yaml:"prefix"`
-	Profile      string         `yaml:"profile"`
-	App          AppConfig      `yaml:"app"`
-	Secrets      []SecretConfig `yaml:"secrets"`
-	InstanceType string         `yaml:"instance_type"`
-	NixImage     string         `yaml:"nix_image"`
-	LockKMS      bool           `yaml:"lock_kms"`
+	Name         string           `yaml:"name"`
+	Version      string           `yaml:"version"`
+	Region       string           `yaml:"region"`
+	Account      string           `yaml:"account"`
+	Prefix       string           `yaml:"prefix"`
+	Profile      string           `yaml:"profile"`
+	App          AppConfig        `yaml:"app"`
+	Secrets      []SecretConfig   `yaml:"secrets"`
+	SDK          SDKConfig        `yaml:"sdk"`
+	InstanceType string           `yaml:"instance_type"`
+	NixImage     string           `yaml:"nix_image"`
+	LockKMS      bool             `yaml:"lock_kms"`
 }
 
 type AppConfig struct {
@@ -44,6 +45,14 @@ type AppConfig struct {
 type SecretConfig struct {
 	Name   string `yaml:"name"`    // SSM parameter name component
 	EnvVar string `yaml:"env_var"` // Env var passed to upstream app
+}
+
+// SDKConfig defines the SDK coordinates for the enclave supervisor binary.
+// These are used by Nix to fetch and build the enclave-supervisor from source.
+type SDKConfig struct {
+	Rev        string `yaml:"rev"`         // SDK git commit SHA
+	Hash       string `yaml:"hash"`        // Nix source hash (SRI format)
+	VendorHash string `yaml:"vendor_hash"` // Go vendor hash (SRI format)
 }
 
 func loadConfig() (*Config, error) {
@@ -79,9 +88,6 @@ func loadConfig() (*Config, error) {
 	if cfg.Region == "" {
 		return nil, fmt.Errorf("%s: 'region' is required", configFile)
 	}
-	if cfg.Account == "" {
-		return nil, fmt.Errorf("%s: 'account' is required", configFile)
-	}
 	// Validate secrets.
 	seen := make(map[string]bool)
 	for i, s := range cfg.Secrets {
@@ -97,6 +103,30 @@ func loadConfig() (*Config, error) {
 		seen[s.Name] = true
 	}
 	return &cfg, nil
+}
+
+// validateAccount checks that the AWS account ID is present. Only needed for
+// commands that interact with AWS (deploy, destroy, status, lock).
+func (c *Config) validateAccount() error {
+	if c.Account == "" {
+		return fmt.Errorf("%s: 'account' is required", configFile)
+	}
+	return nil
+}
+
+// validateSDK checks that SDK coordinates are present. Only needed for commands
+// that build the EIF (build, deploy), not for status/verify/destroy/lock.
+func (c *Config) validateSDK() error {
+	if c.SDK.Rev == "" {
+		return fmt.Errorf("%s: 'sdk.rev' is required (SDK commit SHA)", configFile)
+	}
+	if c.SDK.Hash == "" {
+		return fmt.Errorf("%s: 'sdk.hash' is required (Nix source hash)", configFile)
+	}
+	if c.SDK.VendorHash == "" {
+		return fmt.Errorf("%s: 'sdk.vendor_hash' is required (Go vendor hash)", configFile)
+	}
+	return nil
 }
 
 // configEnv returns environment variables derived from the config, suitable

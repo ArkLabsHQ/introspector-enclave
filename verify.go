@@ -24,7 +24,7 @@ import (
 )
 
 // errAppKeyNotReady is returned when the attestation document's appKeyHash is
-// all zeros, meaning enclave-init hasn't registered its key with nitriding yet.
+// all zeros, meaning the app hasn't registered its key with nitriding yet.
 var errAppKeyNotReady = errors.New("attestation key not yet registered (appKeyHash is all zeros)")
 
 func verifyCmd() *cobra.Command {

@@ -34,6 +34,12 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := cfg.validateSDK(); err != nil {
+		return err
+	}
+	if err := cfg.validateAccount(); err != nil {
+		return err
+	}
 
 	root, err := findRepoRoot()
 	if err != nil {
