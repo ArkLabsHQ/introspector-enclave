@@ -255,7 +255,8 @@ The supervisor exposes management endpoints alongside proxied requests to your a
 |--------|------|-------------|
 | GET | `/health` | Supervisor health check (ready/degraded) |
 | GET | `/v1/enclave-info` | Build + runtime metadata (version, attestation key, previous PCR0) |
-| POST | `/v1/export-key` | Re-encrypt signing key for KMS migration |
+| POST | `/v1/export-key` | Re-encrypt secrets for locked-key migration |
+| POST | `/v1/prepare-upgrade` | Store PCR0 + attestation proof in SSM before upgrade |
 | POST | `/v1/extend-pcr` | Extend a PCR register (16-31) with custom data |
 | POST | `/v1/lock-pcr` | Lock a PCR register (16-31) to prevent further extension |
 | GET | `/enclave/attestation` | Nitro attestation document (served by nitriding) |
@@ -310,14 +311,34 @@ For maximum security, the `lock` command applies an **irreversible** policy usin
 enclave lock
 ```
 
-### Key Migration
+### Upgrade Paths
 
-When deploying a new enclave version (different PCR0) after locking the KMS key, the signing key is migrated automatically:
+When deploying a new enclave version (different PCR0), the upgrade path depends on whether the KMS key is locked.
 
-1. A new KMS key is created with a policy allowing the new PCR0 to decrypt
-2. The old enclave's `POST /v1/export-key` re-encrypts the key with the new KMS key
-3. The ciphertext is stored in SSM, the old enclave is stopped, and the new one boots with the new KMS key
-4. The old locked KMS key is scheduled for deletion (7-day pending window)
+#### Unlocked KMS Key
+
+The KMS key policy still allows `kms:PutKeyPolicy`, so the CLI can update it with the new PCR0:
+
+1. CLI calls `POST /v1/prepare-upgrade` on the old enclave
+2. The old enclave generates an NSM attestation document (signed by AWS Nitro hardware, unforgeable) and stores both the plain PCR0 and the attestation proof in SSM
+3. CLI updates the KMS key policy with the new PCR0
+4. CLI stops the old enclave, uploads the new EIF, and restarts
+
+#### Locked KMS Key (Migration)
+
+The KMS key policy is irreversible — only the old PCR0 can decrypt. Secrets must be re-encrypted to a new KMS key:
+
+1. CLI creates a **new KMS key** with a policy allowing the new PCR0 to decrypt
+2. CLI stores the new key ID (`MigrationKMSKeyID`) and old key ID (`MigrationOldKMSKeyID`) in SSM
+3. CLI calls `POST /v1/export-key` on the old enclave. The old enclave:
+   - Reads `MigrationKMSKeyID` from SSM (this is the only gate — if the param is unset, the endpoint returns an error)
+   - Decrypts each secret using the old KMS key (which only this enclave can do)
+   - Re-encrypts each secret with the new KMS key
+   - Stores the migration ciphertexts in SSM under `Migration/{secretName}/Ciphertext`
+   - Stores its PCR0 and an NSM attestation proof in SSM
+4. CLI copies migration ciphertexts to permanent locations, updates `KMSKeyID` in SSM
+5. CLI stops the old enclave, uploads the new EIF, and restarts
+6. The new enclave boots, decrypts secrets using the new KMS key (PCR0 matches), and schedules the old KMS key for deletion (7-day pending window via `MigrationOldKMSKeyID`)
 
 ### PCR0 Attestation Chain
 
@@ -325,11 +346,13 @@ Each enclave version records its predecessor's PCR0, creating a verifiable upgra
 
 ```
 Genesis -> PCR0_v1 (previous_pcr0=genesis)
-        -> PCR0_v2 (previous_pcr0=PCR0_v1)
-        -> PCR0_v3 (previous_pcr0=PCR0_v2)
+        -> PCR0_v2 (previous_pcr0=PCR0_v1, attestation=<signed proof>)
+        -> PCR0_v3 (previous_pcr0=PCR0_v2, attestation=<signed proof>)
 ```
 
-Exposed via `GET /v1/enclave-info`.
+The attestation proof is an NSM attestation document — a COSE Sign1 structure signed by AWS Nitro hardware. It contains the enclave's PCR values, proving the reported `previous_pcr0` came from a real enclave (not a compromised host).
+
+`GET /v1/enclave-info` returns both `previous_pcr0` and `previous_pcr0_attestation`. The `enclave verify` command automatically verifies the attestation document against the AWS Nitro root certificate and confirms the PCR0 inside matches the reported value.
 
 ## Reproducible Build
 

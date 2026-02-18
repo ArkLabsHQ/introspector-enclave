@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -34,11 +33,11 @@ type SecretDef struct {
 
 // Enclave holds the initialized enclave state.
 type Enclave struct {
-	attestationKey *btcec.PrivateKey
-	secrets        []SecretDef
-	previousPCR0   string
-	initError      string
-	exportOnce     sync.Once
+	attestationKey          *btcec.PrivateKey
+	secrets                 []SecretDef
+	previousPCR0            string
+	previousPCR0Attestation string // base64-encoded COSE Sign1 attestation doc
+	initError               string
 }
 
 // Init initializes the enclave: generates an ephemeral attestation key,
@@ -80,6 +79,9 @@ func Init(ctx context.Context) (*Enclave, error) {
 	if pcr0, err := readMigrationPreviousPCR0(ctx); err == nil {
 		e.previousPCR0 = pcr0
 	}
+	if attestDoc, err := readMigrationPreviousPCR0Attestation(ctx); err == nil {
+		e.previousPCR0Attestation = attestDoc
+	}
 
 	deleteOldKMSKey(ctx)
 	return e, nil
@@ -103,11 +105,13 @@ func (e *Enclave) AttestationPubkey() string {
 //
 //	GET  /v1/enclave-info
 //	POST /v1/export-key
+//	POST /v1/prepare-upgrade
 //	POST /v1/extend-pcr
 //	POST /v1/lock-pcr
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
+	mux.HandleFunc("POST /v1/prepare-upgrade", e.handlePrepareUpgrade)
 	mux.HandleFunc("POST /v1/extend-pcr", e.handleExtendPCR)
 	mux.HandleFunc("POST /v1/lock-pcr", e.handleLockPCR)
 }
@@ -252,15 +256,17 @@ func (e *Enclave) signResponse(body []byte) string {
 // handleEnclaveInfo returns build-time and runtime metadata about this enclave.
 func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	resp := struct {
-		Version           string `json:"version"`
-		PreviousPCR0      string `json:"previous_pcr0"`
-		AttestationPubkey string `json:"attestation_pubkey,omitempty"`
-		Error             string `json:"error,omitempty"`
+		Version                 string `json:"version"`
+		PreviousPCR0            string `json:"previous_pcr0"`
+		PreviousPCR0Attestation string `json:"previous_pcr0_attestation,omitempty"`
+		AttestationPubkey       string `json:"attestation_pubkey,omitempty"`
+		Error                   string `json:"error,omitempty"`
 	}{
-		Version:           Version,
-		PreviousPCR0:      e.previousPCR0,
-		AttestationPubkey: e.AttestationPubkey(),
-		Error:             e.initError,
+		Version:                 Version,
+		PreviousPCR0:            e.previousPCR0,
+		PreviousPCR0Attestation: e.previousPCR0Attestation,
+		AttestationPubkey:       e.AttestationPubkey(),
+		Error:                   e.initError,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)

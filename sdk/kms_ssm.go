@@ -251,6 +251,34 @@ func extractPCR0FromAttestation(attestationDoc []byte) (string, error) {
 	return hex.EncodeToString(pcr0), nil
 }
 
+// getAttestationDocumentB64 generates a minimal NSM attestation document (without
+// an RSA public key) and returns it as base64. The document is a COSE Sign1 structure
+// signed by AWS Nitro hardware, proving this enclave's PCR values.
+func getAttestationDocumentB64() (string, error) {
+	session, err := nsm.OpenDefaultSession()
+	if err != nil {
+		return "", fmt.Errorf("open NSM session: %w", err)
+	}
+	defer session.Close()
+
+	nonce := make([]byte, 32)
+	if _, err := io.ReadFull(session, nonce); err != nil {
+		return "", fmt.Errorf("read nonce: %w", err)
+	}
+
+	resp, err := session.Send(&request.Attestation{
+		Nonce: nonce,
+	})
+	if err != nil {
+		return "", fmt.Errorf("attestation request failed: %w", err)
+	}
+	if resp.Attestation == nil {
+		return "", fmt.Errorf("attestation response missing document")
+	}
+
+	return base64.StdEncoding.EncodeToString(resp.Attestation.Document), nil
+}
+
 // encryptWithKMS encrypts plaintext using KMS and returns base64-encoded ciphertext.
 func encryptWithKMS(ctx context.Context, kmsClient *kms.Client, keyID string, plaintext []byte) (string, error) {
 	out, err := kmsClient.Encrypt(ctx, &kms.EncryptInput{

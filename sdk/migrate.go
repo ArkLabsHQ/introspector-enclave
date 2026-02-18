@@ -19,15 +19,10 @@ import (
 
 // handleExportKey handles POST /v1/export-key.
 // Exports all configured secrets encrypted with a temporary migration KMS key.
-// One-shot: responds exactly once, then returns 410 Gone.
+// Authorization: the endpoint only operates when MigrationKMSKeyID is set in SSM
+// (written by the CLI before calling this endpoint). The exported ciphertexts are
+// encrypted to the new KMS key, which only the new enclave can decrypt.
 func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
-	var ok bool
-	e.exportOnce.Do(func() { ok = true })
-	if !ok {
-		http.Error(w, "already exported", http.StatusGone)
-		return
-	}
-
 	ctx := r.Context()
 	deployment := getDeployment()
 	appName := getAppName()
@@ -39,18 +34,6 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ssmClient := ssm.NewFromConfig(awsCfg)
-
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-	if token == "" {
-		http.Error(w, "missing authorization", http.StatusUnauthorized)
-		return
-	}
-
-	expectedToken, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationToken", deployment, appName))
-	if err != nil || token != expectedToken {
-		http.Error(w, "forbidden", http.StatusForbidden)
-		return
-	}
 
 	migrationKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName))
 	if err != nil {
@@ -93,19 +76,7 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		exported = append(exported, secret.Name)
 	}
 
-	pcr0 := getPCR0()
-	if pcr0 != "" {
-		pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
-		_, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
-			Name:      aws.String(pcr0Param),
-			Value:     aws.String(pcr0),
-			Type:      ssmtypes.ParameterTypeString,
-			Overwrite: aws.Bool(true),
-		})
-		if err != nil {
-			log.Warnf("export-key: store previous PCR0: %v", err)
-		}
-	}
+	pcr0, _ := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
 
 	log.Infof("export-key: exported %d secret(s) (pcr0=%s)", len(exported), pcr0)
 
@@ -130,6 +101,96 @@ func readMigrationPreviousPCR0(ctx context.Context) (string, error) {
 	deployment := getDeployment()
 	appName := getAppName()
 	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName))
+}
+
+// readMigrationPreviousPCR0Attestation reads the previous enclave's attestation
+// document from SSM. Returns a base64-encoded COSE Sign1 structure.
+func readMigrationPreviousPCR0Attestation(ctx context.Context) (string, error) {
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		return "", err
+	}
+	ssmClient := ssm.NewFromConfig(awsCfg)
+	deployment := getDeployment()
+	appName := getAppName()
+	return readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName))
+}
+
+// storePCR0WithAttestation stores both the plain PCR0 and a cryptographic
+// attestation document in SSM. The attestation document is a COSE Sign1
+// structure signed by AWS Nitro hardware, proving the PCR0 value.
+func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deployment, appName string) (string, string) {
+	pcr0 := getPCR0()
+	if pcr0 == "" {
+		return "", ""
+	}
+
+	pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
+	_, err := ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(pcr0Param),
+		Value:     aws.String(pcr0),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+	})
+	if err != nil {
+		log.Warnf("store previous PCR0: %v", err)
+	}
+
+	attestDocB64, err := getAttestationDocumentB64()
+	if err != nil {
+		log.Warnf("generate attestation document: %v", err)
+		return pcr0, ""
+	}
+
+	attestParam := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName)
+	_, err = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
+		Name:      aws.String(attestParam),
+		Value:     aws.String(attestDocB64),
+		Type:      ssmtypes.ParameterTypeString,
+		Overwrite: aws.Bool(true),
+		Tier:      ssmtypes.ParameterTierAdvanced,
+	})
+	if err != nil {
+		log.Warnf("store PCR0 attestation: %v", err)
+		return pcr0, ""
+	}
+
+	return pcr0, attestDocB64
+}
+
+// handlePrepareUpgrade handles POST /v1/prepare-upgrade.
+// Generates an NSM attestation document and stores both the plain PCR0
+// and the attestation document in SSM. Called by the CLI before upgrading
+// an unlocked enclave, so the enclave itself writes its own PCR0 proof.
+func (e *Enclave) handlePrepareUpgrade(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+	deployment := getDeployment()
+	appName := getAppName()
+
+	awsCfg, err := loadAWSConfigWithIMDS(ctx)
+	if err != nil {
+		log.Errorf("prepare-upgrade: load AWS config: %v", err)
+		http.Error(w, "internal error", http.StatusInternalServerError)
+		return
+	}
+	ssmClient := ssm.NewFromConfig(awsCfg)
+
+	pcr0, attestDocB64 := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
+	if pcr0 == "" {
+		http.Error(w, "could not read PCR0 from NSM", http.StatusInternalServerError)
+		return
+	}
+
+	log.Infof("prepare-upgrade: stored PCR0=%s with attestation proof", pcr0)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(struct {
+		PCR0        string `json:"pcr0"`
+		Attestation string `json:"attestation,omitempty"`
+	}{
+		PCR0:        pcr0,
+		Attestation: attestDocB64,
+	})
 }
 
 // deleteOldKMSKey checks if MigrationOldKMSKeyID is set in SSM. If so,

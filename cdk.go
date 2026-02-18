@@ -114,11 +114,6 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	}
 
 	// Shared migration parameters (one per deployment, not per secret).
-	migrationTokenParam := awsssm.NewStringParameter(stack, jsii.String("MigrationToken"), &awsssm.StringParameterProps{
-		StringValue:   jsii.String("UNSET"),
-		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationToken", deployment, appName)),
-	})
-
 	migrationKMSKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("MigrationKMSKeyID"), &awsssm.StringParameterProps{
 		StringValue:   jsii.String("UNSET"),
 		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName)),
@@ -127,6 +122,12 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	migrationPreviousPCR0Param := awsssm.NewStringParameter(stack, jsii.String("MigrationPreviousPCR0"), &awsssm.StringParameterProps{
 		StringValue:   jsii.String("UNSET"),
 		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)),
+	})
+
+	migrationPreviousPCR0AttestationParam := awsssm.NewStringParameter(stack, jsii.String("MigrationPreviousPCR0Attestation"), &awsssm.StringParameterProps{
+		StringValue:   jsii.String("UNSET"),
+		ParameterName: jsii.String(fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName)),
+		Tier:          awsssm.ParameterTier_ADVANCED,
 	})
 
 	migrationOldKMSKeyIDParam := awsssm.NewStringParameter(stack, jsii.String("MigrationOldKMSKeyID"), &awsssm.StringParameterProps{
@@ -226,10 +227,11 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		param.GrantRead(role)
 		param.GrantWrite(role)
 	}
-	migrationTokenParam.GrantRead(role)
 	migrationKMSKeyIDParam.GrantRead(role)
 	migrationPreviousPCR0Param.GrantRead(role)
 	migrationPreviousPCR0Param.GrantWrite(role)
+	migrationPreviousPCR0AttestationParam.GrantRead(role)
+	migrationPreviousPCR0AttestationParam.GrantWrite(role)
 	migrationOldKMSKeyIDParam.GrantRead(role)
 	migrationOldKMSKeyIDParam.GrantWrite(role)
 
