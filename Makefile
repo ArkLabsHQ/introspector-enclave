@@ -35,7 +35,7 @@ sdk-hashes: ## Compute hashes, commit, tag REV (LOCAL=1 to skip Docker)
 	  echo "Error: REV=$(REV) looks like a default — pass an explicit REV=vX.Y.Z"; exit 1; \
 	fi
 	@# Step 1: Compute vendor hash via a failing nix build.
-	@echo "[sdk-hashes] Computing vendor hash (this does a trial nix build)..."
+	@echo "[sdk-hashes] Computing vendor hash (trial nix build)..."
 	@NIX_EXPR='let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule { pname = "enclave-supervisor"; version = "dev"; src = ./.; subPackages = ["cmd/enclave-supervisor"]; vendorHash = ""; doCheck = false; }' && \
 	if [ -n "$(LOCAL)" ]; then \
 	  OUTPUT=$$(cd sdk && nix build --impure \
@@ -47,31 +47,18 @@ sdk-hashes: ## Compute hashes, commit, tag REV (LOCAL=1 to skip Docker)
 	    nix build --impure --extra-experimental-features 'nix-command flakes' \
 	    --expr '$$NIX_EXPR'" 2>&1); \
 	fi; \
-	EXPECTED=$$(echo "$$OUTPUT" | grep 'got:' | awk '{print $$2}') && \
-	if [ -n "$$EXPECTED" ]; then \
-	  echo '{"rev":"$(REV)","hash":"","vendor_hash":"'$$EXPECTED'"}' | jq '.' > $(HASHES_FILE) && \
-	  echo "  Vendor hash: $$EXPECTED"; \
-	else \
+	VENDOR_HASH=$$(echo "$$OUTPUT" | grep 'got:' | awk '{print $$2}') && \
+	if [ -z "$$VENDOR_HASH" ]; then \
 	  echo "Error: could not extract vendor hash from nix build output." && \
 	  echo "$$OUTPUT" | tail -20; \
 	  exit 1; \
-	fi
-	@# Step 2: Commit sdk-hashes.json (with vendor hash, source hash TBD).
-	@echo "[sdk-hashes] Committing sdk-hashes.json..."
-	@git add $(HASHES_FILE) && \
-	git commit -m "sdk hashes for $(REV)"
-	@# Step 3: Create/move tag to this commit (which includes sdk-hashes.json).
-	@if git tag -l "$(REV)" | grep -q .; then \
-	  echo "[sdk-hashes] Moving tag $(REV) to current commit..." && \
-	  git tag -d "$(REV)" && git tag "$(REV)"; \
-	else \
-	  echo "[sdk-hashes] Creating tag $(REV)..." && \
-	  git tag "$(REV)"; \
-	fi
-	@# Step 4: Compute source hash from the tagged tree (now includes sdk-hashes.json).
+	fi && \
+	echo "  Vendor hash: $$VENDOR_HASH" && \
+	echo "$$VENDOR_HASH" > /tmp/sdk-vendor-hash
+	@# Step 2: Compute source hash from HEAD (sdk-hashes.json excluded via .gitattributes).
 	@echo "[sdk-hashes] Computing source hash..."
 	@TMPDIR=$$(mktemp -d) && \
-	git archive --format=tar.gz --prefix=source/ $(REV) | tar xz -C "$$TMPDIR" && \
+	git archive --format=tar.gz --prefix=source/ HEAD | tar xz -C "$$TMPDIR" && \
 	if [ -n "$(LOCAL)" ]; then \
 	  SOURCE_HASH=$$(nix hash path "$$TMPDIR/source"); \
 	else \
@@ -79,14 +66,18 @@ sdk-hashes: ## Compute hashes, commit, tag REV (LOCAL=1 to skip Docker)
 	    nix --extra-experimental-features nix-command hash path /work/source); \
 	fi && \
 	rm -rf "$$TMPDIR" && \
-	jq --arg h "$$SOURCE_HASH" '.hash = $$h' $(HASHES_FILE) > $(HASHES_FILE).tmp && \
-	mv $(HASHES_FILE).tmp $(HASHES_FILE) && \
-	echo "  Source hash: $$SOURCE_HASH"
-	@# Step 5: Amend commit and retag with final source hash.
-	@echo "[sdk-hashes] Finalizing..."
+	echo "  Source hash: $$SOURCE_HASH" && \
+	VENDOR_HASH=$$(cat /tmp/sdk-vendor-hash) && \
+	echo "{\"rev\":\"$(REV)\",\"hash\":\"$$SOURCE_HASH\",\"vendor_hash\":\"$$VENDOR_HASH\"}" | jq '.' > $(HASHES_FILE) && \
+	rm -f /tmp/sdk-vendor-hash
+	@# Step 3: Commit and tag.
+	@echo "[sdk-hashes] Committing and tagging..."
 	@git add $(HASHES_FILE) && \
-	git commit --amend --no-edit && \
-	git tag -d "$(REV)" && git tag "$(REV)" && \
+	git commit -m "sdk hashes for $(REV)" && \
+	if git tag -l "$(REV)" | grep -q .; then \
+	  git tag -d "$(REV)" > /dev/null; \
+	fi && \
+	git tag "$(REV)" && \
 	echo "" && \
 	echo "[sdk-hashes] Done." && \
 	echo "  Push with: git push && git push --tags"
