@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -37,42 +38,49 @@ type Enclave struct {
 	secrets                 []SecretDef
 	previousPCR0            string
 	previousPCR0Attestation string // base64-encoded COSE Sign1 attestation doc
-	initError               string
+	initDone                atomic.Bool  // true after Init completes (happens-before fence)
+	initError               atomic.Value // stores string, updated progressively during init
+}
+
+// New creates an Enclave that is safe to use immediately for serving
+// management endpoints. Call Init() separately to complete initialization.
+func New() *Enclave {
+	return &Enclave{previousPCR0: "genesis"}
 }
 
 // Init initializes the enclave: generates an ephemeral attestation key,
 // loads secrets from KMS via attestation, extends PCRs with secret pubkeys,
 // and checks migration state.
 //
-// On error, Init returns both an *Enclave and an error. The Enclave is still
-// usable for serving management endpoints (e.g. /v1/enclave-info) that report
-// the initialization error.
-func Init(ctx context.Context) (*Enclave, error) {
-	e := &Enclave{
-		previousPCR0: "genesis",
-	}
+// Init may block (e.g. retrying KMS). The HTTP server should be started
+// before calling Init so management endpoints are available during init.
+// On completion (success or failure), initDone is set so handlers can
+// read all fields safely.
+func (e *Enclave) Init(ctx context.Context) error {
+	defer e.initDone.Store(true)
 
 	secrets, err := loadSecretsConfig()
 	if err != nil {
-		e.initError = fmt.Sprintf("load secrets config: %s", err)
-		return e, fmt.Errorf("load secrets config: %w", err)
+		e.setInitError(fmt.Sprintf("load secrets config: %s", err))
+		return fmt.Errorf("load secrets config: %w", err)
 	}
 	e.secrets = secrets
 
 	if err := e.generateAttestationKey(); err != nil {
-		e.initError = fmt.Sprintf("generate attestation key: %s", err)
-		return e, fmt.Errorf("generate attestation key: %w", err)
+		e.setInitError(fmt.Sprintf("generate attestation key: %s", err))
+		return fmt.Errorf("generate attestation key: %w", err)
 	}
 
 	if len(secrets) > 0 {
+		e.setInitError("waiting for KMS secrets")
 		if err := e.waitForSecretsFromKMS(ctx, secrets); err != nil {
-			e.initError = fmt.Sprintf("load secrets from KMS: %s", err)
-			return e, fmt.Errorf("load secrets from KMS: %w", err)
+			e.setInitError(fmt.Sprintf("load secrets from KMS: %s", err))
+			return fmt.Errorf("load secrets from KMS: %w", err)
 		}
 
 		if err := e.extendPCRsWithSecretPubkeys(secrets); err != nil {
-			e.initError = fmt.Sprintf("extend PCRs with secret pubkeys: %s", err)
-			return e, fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
+			e.setInitError(fmt.Sprintf("extend PCRs with secret pubkeys: %s", err))
+			return fmt.Errorf("extend PCRs with secret pubkeys: %w", err)
 		}
 	}
 
@@ -84,12 +92,26 @@ func Init(ctx context.Context) (*Enclave, error) {
 	}
 
 	deleteOldKMSKey(ctx)
-	return e, nil
+	e.setInitError("") // clear — init succeeded
+	return nil
 }
 
-// InitError returns the initialization error message, or empty string on success.
+// setInitError stores an init error message atomically.
+func (e *Enclave) setInitError(msg string) {
+	e.initError.Store(msg)
+}
+
+// InitError returns the initialization error/status message, or empty string on success.
 func (e *Enclave) InitError() string {
-	return e.initError
+	if v := e.initError.Load(); v != nil {
+		return v.(string)
+	}
+	return ""
+}
+
+// IsReady returns true after Init has completed (success or failure).
+func (e *Enclave) IsReady() bool {
+	return e.initDone.Load()
 }
 
 // AttestationPubkey returns the hex-encoded compressed public key of the
@@ -118,9 +140,10 @@ func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 
 // Middleware returns an http.Handler that signs all responses with the
 // ephemeral attestation key using BIP-340 Schnorr signatures.
+// Before init completes, responses pass through unsigned.
 func (e *Enclave) Middleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if e.attestationKey == nil {
+		if !e.initDone.Load() || e.attestationKey == nil {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -254,8 +277,28 @@ func (e *Enclave) signResponse(body []byte) string {
 }
 
 // handleEnclaveInfo returns build-time and runtime metadata about this enclave.
+// Before init completes, returns 503 with partial state so callers get meaningful
+// JSON instead of 502, while curl -sf health checks still fail (deploy.go lockKMSKey).
 func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
-	resp := struct {
+	w.Header().Set("Content-Type", "application/json")
+
+	if !e.initDone.Load() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(struct {
+			Version      string `json:"version"`
+			PreviousPCR0 string `json:"previous_pcr0"`
+			Initializing bool   `json:"initializing"`
+			Error        string `json:"error,omitempty"`
+		}{
+			Version:      Version,
+			PreviousPCR0: "genesis", // safe: migration PCR0 is only loaded during Init
+			Initializing: true,
+			Error:        e.InitError(),
+		})
+		return
+	}
+
+	json.NewEncoder(w).Encode(struct {
 		Version                 string `json:"version"`
 		PreviousPCR0            string `json:"previous_pcr0"`
 		PreviousPCR0Attestation string `json:"previous_pcr0_attestation,omitempty"`
@@ -266,10 +309,8 @@ func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 		PreviousPCR0:            e.previousPCR0,
 		PreviousPCR0Attestation: e.previousPCR0Attestation,
 		AttestationPubkey:       e.AttestationPubkey(),
-		Error:                   e.initError,
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(resp)
+		Error:                   e.InitError(),
+	})
 }
 
 // handleExtendPCR extends a user-defined PCR (16-31) with the provided data.

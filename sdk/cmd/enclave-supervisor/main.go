@@ -22,11 +22,8 @@ func main() {
 		syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 1. Bootstrap: attestation key, KMS secrets, PCR extension.
-	enc, initErr := sdk.Init(ctx)
-	if initErr != nil {
-		log.Printf("enclave init error: %v", initErr)
-	}
+	// 1. Create enclave (instant — no blocking work).
+	enc := sdk.New()
 
 	// 2. Ports.
 	proxyPort := envOr("ENCLAVE_PROXY_PORT", "7073")
@@ -42,6 +39,14 @@ func main() {
 
 	mux.HandleFunc("GET /health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if !enc.IsReady() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "initializing",
+				"error":  enc.InitError(),
+			})
+			return
+		}
 		if enc.InitError() != "" {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			json.NewEncoder(w).Encode(map[string]string{
@@ -64,7 +69,7 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
-	// 5. Start HTTP server.
+	// 5. Start HTTP server immediately (management endpoints available during init).
 	go func() {
 		log.Printf("supervisor :%s -> :%s (version=%s)", proxyPort, appPort, sdk.Version)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -72,7 +77,12 @@ func main() {
 		}
 	}()
 
-	// 6. Start user's app as child process.
+	// 6. Bootstrap: attestation key, KMS secrets, PCR extension (may block).
+	if err := enc.Init(ctx); err != nil {
+		log.Printf("enclave init error: %v", err)
+	}
+
+	// 7. Start user's app as child process (env vars from KMS are ready).
 	appBinary := envOr("APP_BINARY_NAME", "app")
 	appPath := fmt.Sprintf("/app/%s", appBinary)
 
@@ -88,7 +98,7 @@ func main() {
 	}
 	log.Printf("child: %s pid=%d", appPath, child.Process.Pid)
 
-	// 7. Supervise: wait for child exit or shutdown signal.
+	// 8. Supervise: wait for child exit or shutdown signal.
 	childDone := make(chan error, 1)
 	go func() { childDone <- child.Wait() }()
 

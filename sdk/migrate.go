@@ -23,6 +23,10 @@ import (
 // (written by the CLI before calling this endpoint). The exported ciphertexts are
 // encrypted to the new KMS key, which only the new enclave can decrypt.
 func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
 	ctx := r.Context()
 	deployment := getDeployment()
 	appName := getAppName()
@@ -163,6 +167,11 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deploy
 // and the attestation document in SSM. Called by the CLI before upgrading
 // an unlocked enclave, so the enclave itself writes its own PCR0 proof.
 func (e *Enclave) handlePrepareUpgrade(w http.ResponseWriter, r *http.Request) {
+	if !e.initDone.Load() {
+		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
+		return
+	}
+
 	ctx := r.Context()
 	deployment := getDeployment()
 	appName := getAppName()
