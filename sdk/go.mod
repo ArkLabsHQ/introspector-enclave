@@ -14,7 +14,6 @@ require (
 	github.com/edgebitio/nitro-enclaves-sdk-go v1.0.0
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/hf/nsm v0.0.0-20220930140112-cd181bd646b9
-	github.com/sirupsen/logrus v1.9.3
 )
 
 require (
@@ -37,6 +36,5 @@ require (
 	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/stretchr/testify v1.10.0 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
-	golang.org/x/sys v0.37.0 // indirect
 	gopkg.in/yaml.v2 v2.3.0 // indirect
 )

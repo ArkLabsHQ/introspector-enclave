@@ -13,7 +13,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awscfg "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
-	log "github.com/sirupsen/logrus"
 )
 
 // imdsCredentials holds temporary credentials fetched from IMDS.
@@ -55,7 +54,6 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 		return nil, fmt.Errorf("read IMDS token: %w", err)
 	}
 	token := string(tokenBytes)
-	log.Debug("fetched IMDS token")
 
 	roleURL := fmt.Sprintf("http://%s/latest/meta-data/iam/security-credentials/", endpoint)
 	roleReq, err := http.NewRequestWithContext(ctx, http.MethodGet, roleURL, nil)
@@ -75,7 +73,6 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 		return nil, fmt.Errorf("read IAM role: %w", err)
 	}
 	roleName := strings.TrimSpace(string(roleBytes))
-	log.Debugf("fetched IAM role: %s", roleName)
 
 	credsURL := fmt.Sprintf("http://%s/latest/meta-data/iam/security-credentials/%s", endpoint, roleName)
 	credsReq, err := http.NewRequestWithContext(ctx, http.MethodGet, credsURL, nil)
@@ -94,8 +91,6 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 	if err := json.NewDecoder(credsResp.Body).Decode(&creds); err != nil {
 		return nil, fmt.Errorf("decode credentials: %w", err)
 	}
-	log.Info("fetched temporary credentials from IMDS")
-
 	return &creds, nil
 }
 
@@ -103,7 +98,6 @@ func fetchIMDSCredentials(ctx context.Context) (*imdsCredentials, error) {
 func loadAWSConfigWithIMDS(ctx context.Context) (aws.Config, error) {
 	imdsCreds, err := fetchIMDSCredentials(ctx)
 	if err != nil {
-		log.WithError(err).Warn("failed to fetch IMDS credentials, falling back to default config")
 		return awscfg.LoadDefaultConfig(ctx)
 	}
 
@@ -133,6 +127,5 @@ func loadAWSConfigWithIMDS(ctx context.Context) (aws.Config, error) {
 		return aws.Config{}, fmt.Errorf("load AWS config with IMDS credentials: %w", err)
 	}
 
-	log.Infof("loaded AWS config with IMDS credentials for region %s", region)
 	return cfg, nil
 }
