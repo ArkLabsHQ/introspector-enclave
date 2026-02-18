@@ -1,6 +1,6 @@
 module github.com/ArkLabsHQ/introspector-enclave/sdk
 
-go 1.25.5
+go 1.24.0
 
 replace github.com/btcsuite/btcd/btcec/v2 => github.com/btcsuite/btcd/btcec/v2 v2.3.3
 
