@@ -65,7 +65,6 @@ jobs:
                 src = ./.;
                 subPackages = [\"cmd/enclave-supervisor\"];
                 vendorHash = \"$(jq -r '.vendor_hash' ../sdk-hashes.json 2>/dev/null || echo '')\";
-                env.CGO_ENABLED = \"0\";
                 buildFlags = [\"-trimpath\"];
                 tags = [\"netgo\"];
                 doCheck = false;
