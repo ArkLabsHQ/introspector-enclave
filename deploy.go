@@ -350,15 +350,16 @@ func deployUpgradeLocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0,
 	return nil
 }
 
-// restartEnclaveOnHost downloads the new EIF from S3, terminates the old enclave, and restarts the watchdog.
+// restartEnclaveOnHost downloads the new EIF from S3, replaces the EIF the watchdog
+// uses (enclave.eif, matching EIF_PATH in /etc/environment), and restarts the watchdog.
+// The watchdog's enclave name comes from ENCLAVE_NAME in /etc/environment (default "app").
 func restartEnclaveOnHost(ctx context.Context, ac *awsClients, cfg *Config, instanceID, eifBucket string) error {
-	eifName := cfg.Name + ".eif"
 	return ac.runOnHost(ctx, instanceID, "stop enclave, update EIF, restart watchdog", []string{
 		"set -e",
-		fmt.Sprintf("aws s3 cp s3://%s/image.eif /tmp/new-%s --region %s", eifBucket, eifName, cfg.Region),
-		fmt.Sprintf("nitro-cli terminate-enclave --enclave-name %s 2>/dev/null || true", cfg.Name),
-		fmt.Sprintf("cp /tmp/new-%s /home/ec2-user/app/server/%s", eifName, eifName),
-		fmt.Sprintf("chown ec2-user:ec2-user /home/ec2-user/app/server/%s", eifName),
+		fmt.Sprintf("aws s3 cp s3://%s/image.eif /tmp/new-enclave.eif --region %s", eifBucket, cfg.Region),
+		`nitro-cli terminate-enclave --enclave-name "${ENCLAVE_NAME:-app}" 2>/dev/null || true`,
+		"cp /tmp/new-enclave.eif /home/ec2-user/app/server/enclave.eif",
+		"chown ec2-user:ec2-user /home/ec2-user/app/server/enclave.eif",
 		"systemctl restart enclave-watchdog",
 	})
 }
