@@ -56,13 +56,13 @@ sdk-hashes: ## Tag REV, compute source+vendor hashes, commit (LOCAL=1 to skip Do
 	echo "  Source hash: $$SOURCE_HASH"
 	@# Step 3: Compute vendor hash via a failing nix build.
 	@echo "[sdk-hashes] Computing vendor hash (this does a trial nix build)..."
-	@NIX_EXPR='let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule { pname = "enclave-supervisor"; version = "dev"; src = ./.; subPackages = ["cmd/enclave-supervisor"]; vendorHash = ""; env.CGO_ENABLED = "0"; doCheck = false; }' && \
+	@NIX_EXPR='let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule { pname = "enclave-supervisor"; version = "dev"; src = ./.; subPackages = ["cmd/enclave-supervisor"]; vendorHash = ""; doCheck = false; }' && \
 	if [ -n "$(LOCAL)" ]; then \
 	  OUTPUT=$$(cd sdk && nix build --impure \
 	    --extra-experimental-features 'nix-command flakes' \
 	    --expr "$$NIX_EXPR" 2>&1); \
 	else \
-	  OUTPUT=$$(docker run --rm -v "$(CURDIR):/src" -w /src/sdk $(NIX_IMAGE) \
+	  OUTPUT=$$(docker run --rm -e NIX_PATH=nixpkgs=channel:nixos-25.05 -v "$(CURDIR):/src" -w /src/sdk $(NIX_IMAGE) \
 	    sh -c "git config --global --add safe.directory /src && \
 	    nix build --impure --extra-experimental-features 'nix-command flakes' \
 	    --expr '$$NIX_EXPR'" 2>&1); \
