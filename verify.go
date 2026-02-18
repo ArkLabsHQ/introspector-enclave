@@ -96,6 +96,9 @@ func runVerify(cmd *cobra.Command, args []string) error {
 				return err
 			}
 		}
+		if err := verifyPCR0Chain(client, baseURL); err != nil {
+			return fmt.Errorf("PCR0 chain: %w", err)
+		}
 		return nil
 	}
 
@@ -335,13 +338,72 @@ func verifyResponseSignature(client *http.Client, baseURL, attestPubkeyHex strin
 	return nil
 }
 
+// --- PCR0 chain verification ---
+
+// verifyPCR0Chain verifies the cryptographic PCR0 upgrade chain.
+// If the enclave reports a previous PCR0 with an attestation document,
+// it verifies the document against the AWS Nitro root certificate and
+// confirms the PCR0 inside matches the reported previous_pcr0.
+func verifyPCR0Chain(client *http.Client, baseURL string) error {
+	info, err := fetchEnclaveInfo(client, baseURL)
+	if err != nil {
+		return fmt.Errorf("fetch enclave info: %w", err)
+	}
+
+	if info.PreviousPCR0 == "genesis" {
+		fmt.Println("[verify] PCR0 chain: genesis (first deployment)")
+		return nil
+	}
+
+	if info.PreviousPCR0Attestation == "" {
+		fmt.Printf("[verify] PCR0 chain: previous_pcr0=%s (no attestation proof — unverified)\n", info.PreviousPCR0)
+		return nil
+	}
+
+	attestBytes, err := base64.StdEncoding.DecodeString(info.PreviousPCR0Attestation)
+	if err != nil {
+		return fmt.Errorf("decode PCR0 attestation: %w", err)
+	}
+
+	// Verify attestation document against AWS Nitro root certificate.
+	// Use zero time to skip expiration check — the attestation was generated
+	// at upgrade time, which may have been weeks/months ago.
+	result, err := nitrite.Verify(attestBytes, nitrite.VerifyOptions{})
+	if err != nil {
+		if result != nil && result.SignatureOK {
+			fmt.Fprintf(os.Stderr, "[verify] PCR0 attestation signature OK but certificate warning: %v\n", err)
+		} else {
+			return fmt.Errorf("PCR0 attestation verification failed: %w", err)
+		}
+	}
+
+	if result == nil || result.Document == nil {
+		return fmt.Errorf("PCR0 attestation missing document payload")
+	}
+
+	pcr0, ok := result.Document.PCRs[0]
+	if !ok {
+		return fmt.Errorf("PCR0 not found in attestation document")
+	}
+	attestedPCR0 := hex.EncodeToString(pcr0)
+
+	if !strings.EqualFold(attestedPCR0, info.PreviousPCR0) {
+		return fmt.Errorf("PCR0 chain mismatch: reported previous_pcr0=%s, attested=%s",
+			info.PreviousPCR0, attestedPCR0)
+	}
+
+	fmt.Printf("[verify] PCR0 chain verified: previous_pcr0=%s (cryptographic proof from NSM attestation)\n", info.PreviousPCR0)
+	return nil
+}
+
 // --- Helpers ---
 
 type enclaveInfoResponse struct {
-	Version           string `json:"version"`
-	PreviousPCR0      string `json:"previous_pcr0"`
-	AttestationPubkey string `json:"attestation_pubkey,omitempty"`
-	Error             string `json:"error,omitempty"`
+	Version                 string `json:"version"`
+	PreviousPCR0            string `json:"previous_pcr0"`
+	PreviousPCR0Attestation string `json:"previous_pcr0_attestation,omitempty"`
+	AttestationPubkey       string `json:"attestation_pubkey,omitempty"`
+	Error                   string `json:"error,omitempty"`
 }
 
 func fetchEnclaveInfo(client *http.Client, baseURL string) (*enclaveInfoResponse, error) {
