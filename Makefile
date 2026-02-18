@@ -30,31 +30,11 @@ build: ## Build the enclave CLI with SDK hashes baked in
 install: ## Install the enclave CLI to $GOPATH/bin with SDK hashes baked in
 	go install -ldflags '$(LDFLAGS)' ./cmd/enclave
 
-sdk-hashes: ## Tag REV, compute source+vendor hashes, commit (LOCAL=1 to skip Docker)
+sdk-hashes: ## Compute hashes, commit, tag REV (LOCAL=1 to skip Docker)
 	@if [ "$(REV)" = "$$(git describe --tags --abbrev=0 2>/dev/null || git rev-parse HEAD)" ] && ! git tag -l "$(REV)" | grep -q .; then \
 	  echo "Error: REV=$(REV) looks like a default — pass an explicit REV=vX.Y.Z"; exit 1; \
 	fi
-	@# Step 1: Create the tag if it doesn't exist yet.
-	@if git tag -l "$(REV)" | grep -q .; then \
-	  echo "[sdk-hashes] Tag $(REV) already exists"; \
-	else \
-	  echo "[sdk-hashes] Creating tag $(REV)..." && \
-	  git tag "$(REV)"; \
-	fi
-	@# Step 2: Compute source hash from the tagged tree.
-	@echo "[sdk-hashes] Computing source hash..."
-	@TMPDIR=$$(mktemp -d) && \
-	git archive --format=tar.gz --prefix=source/ $(REV) | tar xz -C "$$TMPDIR" && \
-	if [ -n "$(LOCAL)" ]; then \
-	  SOURCE_HASH=$$(nix hash path "$$TMPDIR/source"); \
-	else \
-	  SOURCE_HASH=$$(docker run --rm -v "$$TMPDIR:/work:ro" $(NIX_IMAGE) \
-	    nix --extra-experimental-features nix-command hash path /work/source); \
-	fi && \
-	rm -rf "$$TMPDIR" && \
-	echo '{"rev":"$(REV)","hash":"'$$SOURCE_HASH'","vendor_hash":""}' | jq '.' > $(HASHES_FILE) && \
-	echo "  Source hash: $$SOURCE_HASH"
-	@# Step 3: Compute vendor hash via a failing nix build.
+	@# Step 1: Compute vendor hash via a failing nix build.
 	@echo "[sdk-hashes] Computing vendor hash (this does a trial nix build)..."
 	@NIX_EXPR='let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule { pname = "enclave-supervisor"; version = "dev"; src = ./.; subPackages = ["cmd/enclave-supervisor"]; vendorHash = ""; doCheck = false; }' && \
 	if [ -n "$(LOCAL)" ]; then \
@@ -69,18 +49,44 @@ sdk-hashes: ## Tag REV, compute source+vendor hashes, commit (LOCAL=1 to skip Do
 	fi; \
 	EXPECTED=$$(echo "$$OUTPUT" | grep 'got:' | awk '{print $$2}') && \
 	if [ -n "$$EXPECTED" ]; then \
-	  jq --arg vh "$$EXPECTED" '.vendor_hash = $$vh' $(HASHES_FILE) > $(HASHES_FILE).tmp && \
-	  mv $(HASHES_FILE).tmp $(HASHES_FILE) && \
+	  echo '{"rev":"$(REV)","hash":"","vendor_hash":"'$$EXPECTED'"}' | jq '.' > $(HASHES_FILE) && \
 	  echo "  Vendor hash: $$EXPECTED"; \
 	else \
 	  echo "Error: could not extract vendor hash from nix build output." && \
 	  echo "$$OUTPUT" | tail -20; \
 	  exit 1; \
 	fi
-	@# Step 4: Commit sdk-hashes.json.
+	@# Step 2: Commit sdk-hashes.json (with vendor hash, source hash TBD).
 	@echo "[sdk-hashes] Committing sdk-hashes.json..."
 	@git add $(HASHES_FILE) && \
-	git commit -m "sdk hashes for $(REV)" && \
+	git commit -m "sdk hashes for $(REV)"
+	@# Step 3: Create/move tag to this commit (which includes sdk-hashes.json).
+	@if git tag -l "$(REV)" | grep -q .; then \
+	  echo "[sdk-hashes] Moving tag $(REV) to current commit..." && \
+	  git tag -d "$(REV)" && git tag "$(REV)"; \
+	else \
+	  echo "[sdk-hashes] Creating tag $(REV)..." && \
+	  git tag "$(REV)"; \
+	fi
+	@# Step 4: Compute source hash from the tagged tree (now includes sdk-hashes.json).
+	@echo "[sdk-hashes] Computing source hash..."
+	@TMPDIR=$$(mktemp -d) && \
+	git archive --format=tar.gz --prefix=source/ $(REV) | tar xz -C "$$TMPDIR" && \
+	if [ -n "$(LOCAL)" ]; then \
+	  SOURCE_HASH=$$(nix hash path "$$TMPDIR/source"); \
+	else \
+	  SOURCE_HASH=$$(docker run --rm -v "$$TMPDIR:/work:ro" $(NIX_IMAGE) \
+	    nix --extra-experimental-features nix-command hash path /work/source); \
+	fi && \
+	rm -rf "$$TMPDIR" && \
+	jq --arg h "$$SOURCE_HASH" '.hash = $$h' $(HASHES_FILE) > $(HASHES_FILE).tmp && \
+	mv $(HASHES_FILE).tmp $(HASHES_FILE) && \
+	echo "  Source hash: $$SOURCE_HASH"
+	@# Step 5: Amend commit and retag with final source hash.
+	@echo "[sdk-hashes] Finalizing..."
+	@git add $(HASHES_FILE) && \
+	git commit --amend --no-edit && \
+	git tag -d "$(REV)" && git tag "$(REV)" && \
 	echo "" && \
 	echo "[sdk-hashes] Done." && \
 	echo "  Push with: git push && git push --tags"
