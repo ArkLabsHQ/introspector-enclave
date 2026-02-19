@@ -23,7 +23,6 @@ import (
 	"github.com/fxamacker/cbor/v2"
 	"github.com/hf/nsm"
 	"github.com/hf/nsm/request"
-	log "github.com/sirupsen/logrus"
 )
 
 // attestationDocument represents the CBOR structure of a Nitro attestation document.
@@ -34,13 +33,11 @@ type attestationDocument struct {
 // waitForSecretsFromKMS waits until all configured secrets are loaded from KMS.
 func (e *Enclave) waitForSecretsFromKMS(ctx context.Context, secrets []SecretDef) error {
 	interval := 5 * time.Second
-	log.Infof("initializing %d secret(s) via KMS", len(secrets))
 
 	for {
 		allLoaded := true
 		for _, s := range secrets {
 			if err := initializeOrLoadSecret(ctx, s); err != nil {
-				log.WithError(err).Warnf("KMS operation failed for %s; retrying", s.Name)
 				allLoaded = false
 				break
 			}
@@ -88,11 +85,9 @@ func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 	}
 
 	if ciphertextB64 == "" {
-		log.Infof("no existing secret %q found, generating new one", secret.Name)
 		return generateAndStoreSecret(ctx, kmsClient, ssmClient, keyID, paramName, secret.EnvVar)
 	}
 
-	log.Infof("found existing secret %q ciphertext, decrypting", secret.Name)
 	return decryptExistingSecret(ctx, kmsClient, keyID, ciphertextB64, secret.EnvVar)
 }
 
@@ -103,13 +98,11 @@ func generateAndStoreSecret(ctx context.Context, kmsClient *kms.Client, ssmClien
 	if _, err := rand.Read(secretBytes); err != nil {
 		return fmt.Errorf("generate random bytes: %w", err)
 	}
-	log.Info("generated new 32-byte secret")
 
 	ciphertextB64, err := encryptWithKMS(ctx, kmsClient, keyID, secretBytes)
 	if err != nil {
 		return err
 	}
-	log.Info("encrypted secret with KMS")
 
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
@@ -122,11 +115,10 @@ func generateAndStoreSecret(ctx context.Context, kmsClient *kms.Client, ssmClien
 		return err
 	}
 
-	pcr0, err := extractPCR0FromAttestation(attestationDoc)
+	_, err = extractPCR0FromAttestation(attestationDoc)
 	if err != nil {
 		return err
 	}
-	log.Infof("PCR0 for KMS policy (apply externally): %s", pcr0)
 
 	if err := storeCiphertextInSSM(ctx, ssmClient, paramName, ciphertextB64); err != nil {
 		return err
@@ -137,7 +129,6 @@ func generateAndStoreSecret(ctx context.Context, kmsClient *kms.Client, ssmClien
 		return fmt.Errorf("set %s: %w", envVar, err)
 	}
 
-	log.Infof("successfully initialized new secret (env=%s)", envVar)
 	return nil
 }
 
@@ -188,7 +179,6 @@ func decryptExistingSecret(ctx context.Context, kmsClient *kms.Client, keyID, ci
 		return fmt.Errorf("set %s: %w", envVar, err)
 	}
 
-	log.Infof("successfully decrypted existing secret (env=%s)", envVar)
 	return nil
 }
 
@@ -302,7 +292,6 @@ func storeCiphertextInSSM(ctx context.Context, ssmClient *ssm.Client, paramName,
 	if err != nil {
 		return fmt.Errorf("ssm put-parameter %s: %w", paramName, err)
 	}
-	log.Infof("stored ciphertext in SSM parameter: %s", paramName)
 	return nil
 }
 

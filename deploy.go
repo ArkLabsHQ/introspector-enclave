@@ -22,7 +22,7 @@ Fresh deploy: CDK deploy → apply KMS policy → wait for instance.
 Upgrade (unlocked key): Update KMS policy → upload new EIF → restart.
 Upgrade (locked key): Create temp KMS key → export via enclave API → restart.
 
-Requires 'enclave build' to have been run first (artifacts/pcr.json and artifacts/image.eif).`,
+Requires 'enclave build' to have been run first (enclave/artifacts/pcr.json and enclave/artifacts/image.eif).`,
 		RunE: runDeploy,
 	}
 }
@@ -60,7 +60,7 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	// Step 2: Detect upgrade mode.
 	// An upgrade is when the instance is already running with initialized secrets.
 	stack := cfg.stackName()
-	outputsPath := filepath.Join(root, "cdk-outputs.json")
+	outputsPath := filepath.Join(root, "enclave", "cdk-outputs.json")
 
 	isUpgrade := false
 	var instanceID string
@@ -194,9 +194,9 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0,
 	}
 
 	// Upload new EIF.
-	eifPath := filepath.Join(root, "artifacts", "image.eif")
+	eifPath := filepath.Join(root, "enclave", "artifacts", "image.eif")
 	if _, err := os.Stat(eifPath); os.IsNotExist(err) {
-		return fmt.Errorf("artifacts/image.eif not found. Run 'enclave build' first.")
+		return fmt.Errorf("enclave/artifacts/image.eif not found. Run 'enclave build' first.")
 	}
 
 	fmt.Printf("[deploy] Uploading new EIF to s3://%s/image.eif ...\n", eifBucket)
@@ -500,10 +500,10 @@ func lockKMSKey(ctx context.Context, ac *awsClients, cfg *Config, keyID, pcr0, e
 
 // readPCR0 reads the PCR0 value from artifacts/pcr.json.
 func readPCR0(root string) (string, error) {
-	pcrPath := filepath.Join(root, "artifacts", "pcr.json")
+	pcrPath := filepath.Join(root, "enclave", "artifacts", "pcr.json")
 	data, err := os.ReadFile(pcrPath)
 	if err != nil {
-		return "", fmt.Errorf("artifacts/pcr.json not found. Run 'enclave build' first.")
+		return "", fmt.Errorf("enclave/artifacts/pcr.json not found. Run 'enclave build' first.")
 	}
 	var pcrs PCRValues
 	if err := json.Unmarshal(data, &pcrs); err != nil {

@@ -153,9 +153,9 @@ func (c *Config) configEnv() []string {
 type CDKOutputs map[string]map[string]string
 
 func loadCDKOutputs(root string) (CDKOutputs, error) {
-	data, err := os.ReadFile(filepath.Join(root, "cdk-outputs.json"))
+	data, err := os.ReadFile(filepath.Join(root, "enclave", "cdk-outputs.json"))
 	if err != nil {
-		return nil, fmt.Errorf("cannot read cdk-outputs.json: %w\nRun 'enclave deploy' first.", err)
+		return nil, fmt.Errorf("cannot read enclave/cdk-outputs.json: %w\nRun 'enclave deploy' first.", err)
 	}
 	var outputs CDKOutputs
 	if err := json.Unmarshal(data, &outputs); err != nil {

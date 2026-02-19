@@ -475,7 +475,7 @@ func buildAndExtractPCR0(repoPath, version, region, nixImage string) (string, er
 		return "", fmt.Errorf("resolve repo path: %w", err)
 	}
 
-	resultPath := filepath.Join(absRepo, "artifacts")
+	resultPath := filepath.Join(absRepo, "enclave", "artifacts")
 	_ = os.RemoveAll(resultPath)
 	_ = os.MkdirAll(resultPath, 0o755)
 
@@ -492,9 +492,9 @@ func buildAndExtractPCR0(repoPath, version, region, nixImage string) (string, er
 
 	nixCmd := "git config --global --add safe.directory /src && " +
 		"nix build --impure --extra-experimental-features 'nix-command flakes' " +
-		"--option download-attempts 3 .#eif && " +
-		"cp result/image.eif /src/artifacts/image.eif && " +
-		"cp result/pcr.json /src/artifacts/pcr.json"
+		"--option download-attempts 3 --out-link flake_result .#eif && " +
+		"cp flake_result/image.eif /src/enclave/artifacts/image.eif && " +
+		"cp flake_result/pcr.json /src/enclave/artifacts/pcr.json"
 
 	env := []string{
 		"VERSION=" + version,

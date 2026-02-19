@@ -56,6 +56,6 @@ func runDestroy(cmd *cobra.Command, args []string) error {
 	env := cfg.configEnv()
 	return runCmd("cdk", []string{
 		"destroy", "--force",
-		"--app", filepath.Join(root, "cdk.out"),
+		"--app", filepath.Join(root, "enclave", "cdk.out"),
 	}, root, env)
 }

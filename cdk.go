@@ -66,9 +66,9 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 		File:      jsii.String("enclave/gvproxy/Dockerfile"),
 		AssetName: jsii.String("gvisor-tap-vsock"),
 		Exclude: &[]*string{
-			jsii.String("cdk.out"),
-			jsii.String("artifacts"),
-			jsii.String("result"),
+			jsii.String("enclave/cdk.out"),
+			jsii.String("enclave/artifacts"),
+			jsii.String("flake_result"),
 			jsii.String(".git"),
 			jsii.String("bin"),
 		},
@@ -77,7 +77,7 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	// The EIF is built by Nix (nix build .#eif) before CDK deploy.
 	// Upload the pre-built, reproducible EIF to S3.
 	enclaveEif := awss3assets.NewAsset(stack, jsii.String("EnclaveEIF"), &awss3assets.AssetProps{
-		Path: jsii.String(repoPath("artifacts/image.eif")),
+		Path: jsii.String(repoPath("enclave", "artifacts", "image.eif")),
 	})
 
 	enclaveInit := awss3assets.NewAsset(stack, jsii.String("AWSNitroEnclaveInit"), &awss3assets.AssetProps{

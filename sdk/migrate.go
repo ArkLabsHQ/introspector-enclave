@@ -14,7 +14,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/ssm"
 	ssmtypes "github.com/aws/aws-sdk-go-v2/service/ssm/types"
 	"github.com/hf/nsm"
-	log "github.com/sirupsen/logrus"
 )
 
 // handleExportKey handles POST /v1/export-key.
@@ -33,7 +32,6 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
-		log.Errorf("export-key: load AWS config: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
@@ -41,7 +39,6 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 
 	migrationKeyID, err := readSSMParam(ctx, ssmClient, fmt.Sprintf("/%s/%s/MigrationKMSKeyID", deployment, appName))
 	if err != nil {
-		log.Errorf("export-key: migration KMS key ID: %v", err)
 		http.Error(w, "migration key not configured", http.StatusInternalServerError)
 		return
 	}
@@ -52,27 +49,23 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 	for _, secret := range e.secrets {
 		secretValue := os.Getenv(secret.EnvVar)
 		if secretValue == "" {
-			log.Warnf("export-key: secret %s (env=%s) not loaded, skipping", secret.Name, secret.EnvVar)
 			continue
 		}
 
 		keyBytes, err := hex.DecodeString(secretValue)
 		if err != nil {
-			log.Errorf("export-key: invalid hex for %s: %v", secret.Name, err)
 			http.Error(w, fmt.Sprintf("invalid key format for %s", secret.Name), http.StatusInternalServerError)
 			return
 		}
 
 		ciphertextB64, err := encryptWithKMS(ctx, kmsClient, migrationKeyID, keyBytes)
 		if err != nil {
-			log.Errorf("export-key: KMS encrypt %s: %v", secret.Name, err)
 			http.Error(w, fmt.Sprintf("KMS encrypt failed for %s", secret.Name), http.StatusInternalServerError)
 			return
 		}
 
 		ciphertextParam := fmt.Sprintf("/%s/%s/Migration/%s/Ciphertext", deployment, appName, secret.Name)
 		if err := storeCiphertextInSSM(ctx, ssmClient, ciphertextParam, ciphertextB64); err != nil {
-			log.Errorf("export-key: store ciphertext for %s: %v", secret.Name, err)
 			http.Error(w, fmt.Sprintf("SSM store failed for %s", secret.Name), http.StatusInternalServerError)
 			return
 		}
@@ -80,9 +73,11 @@ func (e *Enclave) handleExportKey(w http.ResponseWriter, r *http.Request) {
 		exported = append(exported, secret.Name)
 	}
 
-	pcr0, _ := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
-
-	log.Infof("export-key: exported %d secret(s) (pcr0=%s)", len(exported), pcr0)
+	pcr0, _, err := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	resp := struct {
@@ -123,10 +118,10 @@ func readMigrationPreviousPCR0Attestation(ctx context.Context) (string, error) {
 // storePCR0WithAttestation stores both the plain PCR0 and a cryptographic
 // attestation document in SSM. The attestation document is a COSE Sign1
 // structure signed by AWS Nitro hardware, proving the PCR0 value.
-func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deployment, appName string) (string, string) {
+func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deployment, appName string) (string, string, error) {
 	pcr0 := getPCR0()
 	if pcr0 == "" {
-		return "", ""
+		return "", "", fmt.Errorf("could not read PCR0 from NSM")
 	}
 
 	pcr0Param := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0", deployment, appName)
@@ -137,13 +132,12 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deploy
 		Overwrite: aws.Bool(true),
 	})
 	if err != nil {
-		log.Warnf("store previous PCR0: %v", err)
+		return "", "", fmt.Errorf("store PCR0 in SSM: %w", err)
 	}
 
 	attestDocB64, err := getAttestationDocumentB64()
 	if err != nil {
-		log.Warnf("generate attestation document: %v", err)
-		return pcr0, ""
+		return "", "", fmt.Errorf("generate attestation document: %w", err)
 	}
 
 	attestParam := fmt.Sprintf("/%s/%s/MigrationPreviousPCR0Attestation", deployment, appName)
@@ -155,11 +149,10 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deploy
 		Tier:      ssmtypes.ParameterTierAdvanced,
 	})
 	if err != nil {
-		log.Warnf("store PCR0 attestation: %v", err)
-		return pcr0, ""
+		return "", "", fmt.Errorf("store PCR0 attestation in SSM: %w", err)
 	}
 
-	return pcr0, attestDocB64
+	return pcr0, attestDocB64, nil
 }
 
 // handlePrepareUpgrade handles POST /v1/prepare-upgrade.
@@ -178,19 +171,16 @@ func (e *Enclave) handlePrepareUpgrade(w http.ResponseWriter, r *http.Request) {
 
 	awsCfg, err := loadAWSConfigWithIMDS(ctx)
 	if err != nil {
-		log.Errorf("prepare-upgrade: load AWS config: %v", err)
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	}
 	ssmClient := ssm.NewFromConfig(awsCfg)
 
-	pcr0, attestDocB64 := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
-	if pcr0 == "" {
-		http.Error(w, "could not read PCR0 from NSM", http.StatusInternalServerError)
+	pcr0, attestDocB64, err := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-
-	log.Infof("prepare-upgrade: stored PCR0=%s with attestation proof", pcr0)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(struct {
@@ -225,10 +215,8 @@ func deleteOldKMSKey(ctx context.Context) {
 		PendingWindowInDays: &pendingDays,
 	})
 	if err != nil {
-		log.Warnf("failed to schedule deletion of old KMS key %s: %v", oldKeyID, err)
 		return
 	}
-	log.Infof("scheduled deletion of old KMS key %s (7 day pending window)", oldKeyID)
 
 	_, _ = ssmClient.PutParameter(ctx, &ssm.PutParameterInput{
 		Name:      aws.String(fmt.Sprintf("/%s/%s/MigrationOldKMSKeyID", deployment, appName)),
@@ -280,20 +268,17 @@ func getAppName() string {
 func getPCR0() string {
 	session, err := nsm.OpenDefaultSession()
 	if err != nil {
-		log.Warnf("getPCR0: open NSM session: %v", err)
 		return ""
 	}
 	defer session.Close()
 
 	attestDoc, _, err := buildAttestationDocument(session)
 	if err != nil {
-		log.Warnf("getPCR0: build attestation: %v", err)
 		return ""
 	}
 
 	pcr0, err := extractPCR0FromAttestation(attestDoc)
 	if err != nil {
-		log.Warnf("getPCR0: extract PCR0: %v", err)
 		return ""
 	}
 	return pcr0

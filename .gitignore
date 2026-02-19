@@ -1,20 +1,20 @@
 .vscode
 build/
 bin/
-cdk.out/
+enclave/cdk.out/
 builder/cdk.out/
 
 # Nix build outputs
-artifacts/
-result
-result-*
+enclave/artifacts/
+flake_result
+flake_result-*
 enclave-image.tar.gz
 
 # CDK outputs
-cdk-outputs.json
+enclave/cdk-outputs.json
 
 # Generated build config (from enclave.yaml for Nix)
-build-config.json
+enclave/build-config.json
 
 # Enclave CLI config (contains account IDs)
 enclave.yaml
@@ -23,7 +23,7 @@ enclave.yaml
 # Built binaries
 introspector
 introspector-client
-./bin/ 
+./bin/
 *.eif
 
 # Temporary build artifacts
