@@ -33,7 +33,7 @@ func synthCDKStack(cfg *Config, root string) error {
 		return fmt.Errorf("resolve repo root: %w", err)
 	}
 
-	outDir := filepath.Join(absRoot, "cdk.out")
+	outDir := filepath.Join(absRoot, "enclave", "cdk.out")
 
 	// Provide AZ context so CDK doesn't fall back to dummy AZs.
 	// The Go synth has no context provider, so we supply AZs explicitly.
@@ -75,12 +75,12 @@ func runCDKDeploy(cfg *Config, root string) error {
 		return err
 	}
 
-	outputsPath := filepath.Join(root, "cdk-outputs.json")
+	outputsPath := filepath.Join(root, "enclave", "cdk-outputs.json")
 	env := cfg.configEnv()
 
 	return runCmd("cdk", []string{
 		"deploy",
-		"--app", filepath.Join(root, "cdk.out"),
+		"--app", filepath.Join(root, "enclave", "cdk.out"),
 		"-O", outputsPath,
 	}, root, env)
 }
