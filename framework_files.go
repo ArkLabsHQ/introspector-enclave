@@ -64,6 +64,11 @@ func getFrameworkFiles() []frameworkFile {
 			Content: frameworkVerifyWorkflow,
 		},
 		{
+			RelPath: ".github/workflows/deploy-enclave.yml",
+			Mode:    0644,
+			Content: frameworkDeployWorkflow,
+		},
+		{
 			RelPath: "enclave/.gitignore",
 			Mode:    0644,
 			Content: frameworkGitignore,
@@ -591,6 +596,46 @@ const frameworkFlakeNix = `{
       }
     );
 }
+`
+
+// GitHub Actions workflow — deploy enclave via OIDC-authenticated AWS credentials.
+// Users must set repo variables AWS_ROLE_ARN and AWS_REGION, and configure an
+// OIDC identity provider in AWS IAM for token.actions.githubusercontent.com.
+const frameworkDeployWorkflow = `name: Deploy Enclave
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    if: vars.AWS_ROLE_ARN != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install enclave CLI
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ` + "${{ vars.AWS_ROLE_ARN }}" + `
+          aws-region: ` + "${{ vars.AWS_REGION }}" + `
+
+      - name: Pull Nix Docker image
+        run: docker pull nixos/nix:2.24.9
+
+      - name: Build and deploy
+        run: |
+          enclave build
+          enclave deploy
 `
 
 // GitHub Actions workflow — daily attestation verification + GitHub Pages status page.
