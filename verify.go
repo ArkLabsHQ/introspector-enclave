@@ -34,6 +34,7 @@ func verifyCmd() *cobra.Command {
 		Long:  "Connects to the enclave, verifies PCR0 attestation, and checks response signatures.",
 		RunE:  runVerify,
 	}
+	cmd.Flags().String("base-url", "", "Enclave base URL (overrides CDK outputs)")
 	cmd.Flags().Bool("verify-build", false, "Rebuild EIF locally and compare PCR0")
 	cmd.Flags().Bool("strict-tls", false, "Require CA-signed TLS certificate")
 	cmd.Flags().String("expected-pcr0", "", "Expected PCR0 hex (overrides auto-detection)")
@@ -53,18 +54,21 @@ func runVerify(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	outputs, err := loadCDKOutputs(root)
-	if err != nil {
-		return err
-	}
+	baseURL, _ := cmd.Flags().GetString("base-url")
+	if baseURL == "" {
+		outputs, err := loadCDKOutputs(root)
+		if err != nil {
+			return err
+		}
 
-	stack := cfg.stackName()
-	elasticIP := outputs.getOutput(stack, "ElasticIP", "Elastic IP")
-	if elasticIP == "" {
-		return fmt.Errorf("ElasticIP not found in cdk-outputs.json")
-	}
+		stack := cfg.stackName()
+		elasticIP := outputs.getOutput(stack, "ElasticIP", "Elastic IP")
+		if elasticIP == "" {
+			return fmt.Errorf("ElasticIP not found in cdk-outputs.json (use --base-url to override)")
+		}
 
-	baseURL := "https://" + elasticIP
+		baseURL = "https://" + elasticIP
+	}
 	fmt.Printf("[verify] Verifying %s\n", baseURL)
 
 	pcr0, _ := cmd.Flags().GetString("expected-pcr0")

@@ -58,6 +58,11 @@ func getFrameworkFiles() []frameworkFile {
 			Mode:    0644,
 			Content: frameworkUserData,
 		},
+		{
+			RelPath: ".github/workflows/verify-enclave.yml",
+			Mode:    0644,
+			Content: frameworkVerifyWorkflow,
+		},
 	}
 }
 
@@ -565,4 +570,174 @@ const frameworkFlakeNix = `{
       }
     );
 }
+`
+
+// GitHub Actions workflow — daily attestation verification + GitHub Pages status page.
+// Writes to an attestation/ subdirectory on the gh-pages branch so it coexists
+// with any existing GitHub Pages content.
+const frameworkVerifyWorkflow = `name: Verify Enclave
+
+on:
+  schedule:
+    - cron: '0 0 * * *'  # daily at midnight UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    if: vars.ENCLAVE_URL != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install enclave CLI
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+
+      - name: Build EIF (reproducible)
+        run: enclave build
+
+      - name: Display PCR measurements
+        run: |
+          echo "## PCR Measurements" >> "$GITHUB_STEP_SUMMARY"
+          echo '` + "```" + `json' >> "$GITHUB_STEP_SUMMARY"
+          cat enclave/artifacts/pcr.json >> "$GITHUB_STEP_SUMMARY"
+          echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Verify attestation
+        id: verify
+        run: |
+          pcr0=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
+          pcr1=$(jq -r '.PCR1' enclave/artifacts/pcr.json)
+          pcr2=$(jq -r '.PCR2' enclave/artifacts/pcr.json)
+
+          echo "pcr0=${pcr0}" >> "$GITHUB_OUTPUT"
+          echo "pcr1=${pcr1}" >> "$GITHUB_OUTPUT"
+          echo "pcr2=${pcr2}" >> "$GITHUB_OUTPUT"
+
+          output=$(enclave verify \
+            --base-url "` + "${{ vars.ENCLAVE_URL }}" + `" \
+            --expected-pcr0 "${pcr0}" 2>&1) && status="pass" || status="fail"
+
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "output<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${output}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          echo "## Enclave Verification" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **Status:** ${status}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- **PCR0:** ` + "\\`" + `${pcr0}` + "\\`" + `" >> "$GITHUB_STEP_SUMMARY"
+          echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
+          echo "${output}" >> "$GITHUB_STEP_SUMMARY"
+          echo '` + "```" + `' >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "${status}" = "fail" ]; then
+            exit 1
+          fi
+
+      - name: Generate status files
+        if: always() && steps.verify.outcome != 'skipped'
+        env:
+          VERIFY_STATUS: ` + "${{ steps.verify.outputs.status || 'unknown' }}" + `
+          VERIFY_PCR0: ` + "${{ steps.verify.outputs.pcr0 || '' }}" + `
+          VERIFY_PCR1: ` + "${{ steps.verify.outputs.pcr1 || '' }}" + `
+          VERIFY_PCR2: ` + "${{ steps.verify.outputs.pcr2 || '' }}" + `
+          VERIFY_OUTPUT: ` + "${{ steps.verify.outputs.output || '' }}" + `
+          REPO: ` + "${{ github.repository }}" + `
+          COMMIT_SHA: ` + "${{ github.sha }}" + `
+        run: |
+          mkdir -p _site
+          cat > _site/index.html <<'HTMLEOF'
+          <!DOCTYPE html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Enclave Attestation</title>
+            <style>
+              body { font-family: system-ui, sans-serif; max-width: 720px; margin: 2rem auto; padding: 0 1rem; color: #1a1a1a; }
+              h1 { font-size: 1.4rem; }
+              .status { padding: 0.5rem 1rem; border-radius: 6px; font-weight: 600; display: inline-block; margin: 0.5rem 0; }
+              .pass { background: #d4edda; color: #155724; }
+              .fail { background: #f8d7da; color: #721c24; }
+              .unknown { background: #fff3cd; color: #856404; }
+              table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
+              th, td { text-align: left; padding: 0.5rem; border-bottom: 1px solid #ddd; }
+              th { font-weight: 600; width: 100px; }
+              td { font-family: monospace; font-size: 0.85rem; word-break: break-all; }
+              pre { background: #f5f5f5; padding: 1rem; border-radius: 6px; overflow-x: auto; font-size: 0.85rem; }
+              .meta { color: #666; font-size: 0.85rem; }
+            </style>
+          </head>
+          <body>
+            <h1>Enclave Attestation</h1>
+            <div id="status"></div>
+            <table id="pcr-table"></table>
+            <h2>Verification Output</h2>
+            <pre id="output"></pre>
+            <p class="meta">Last verified: <span id="timestamp"></span></p>
+            <p class="meta">Source: <a id="repo-link" href="#"></a></p>
+            <script>
+              fetch('status.json').then(r => r.json()).then(d => {
+                const labels = { pass: 'Verified', fail: 'FAILED', unknown: 'Unknown' };
+                document.getElementById('status').innerHTML =
+                  '<span class="status ' + d.status + '">' + (labels[d.status] || d.status) + '</span>';
+                const rows = [['PCR0', d.pcr0], ['PCR1', d.pcr1], ['PCR2', d.pcr2]];
+                document.getElementById('pcr-table').innerHTML =
+                  rows.map(function(r) { return '<tr><th>' + r[0] + '</th><td>' + (r[1] || 'N/A') + '</td></tr>'; }).join('');
+                document.getElementById('output').textContent = d.output;
+                document.getElementById('timestamp').textContent = d.timestamp;
+                var link = document.getElementById('repo-link');
+                link.href = 'https://github.com/' + d.repo;
+                link.textContent = d.repo;
+              });
+            </script>
+          </body>
+          </html>
+          HTMLEOF
+
+          jq -n \
+            --arg status "$VERIFY_STATUS" \
+            --arg pcr0 "$VERIFY_PCR0" \
+            --arg pcr1 "$VERIFY_PCR1" \
+            --arg pcr2 "$VERIFY_PCR2" \
+            --arg output "$VERIFY_OUTPUT" \
+            --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --arg commit "$COMMIT_SHA" \
+            --arg repo "$REPO" \
+            '{status: $status, pcr0: $pcr0, pcr1: $pcr1, pcr2: $pcr2, output: $output, timestamp: $timestamp, commit: $commit, repo: $repo}' \
+            > _site/status.json
+
+      - name: Deploy to gh-pages branch
+        if: always() && steps.verify.outcome != 'skipped'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create gh-pages branch if it doesn't exist yet
+          if ! git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
+            git checkout --orphan gh-pages
+            git rm -rf .
+            mkdir -p attestation
+            cp _site/index.html attestation/
+            cp _site/status.json attestation/
+            git add attestation/
+            git commit -m "attestation status page"
+            git push origin gh-pages
+          else
+            git fetch origin gh-pages
+            git checkout gh-pages
+            mkdir -p attestation
+            cp _site/index.html attestation/
+            cp _site/status.json attestation/
+            git add attestation/
+            git diff --cached --quiet && exit 0
+            git commit -m "update attestation status"
+            git push origin gh-pages
+          fi
 `
