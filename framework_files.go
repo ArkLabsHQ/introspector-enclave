@@ -63,8 +63,29 @@ func getFrameworkFiles() []frameworkFile {
 			Mode:    0644,
 			Content: frameworkVerifyWorkflow,
 		},
+		{
+			RelPath: "enclave/.gitignore",
+			Mode:    0644,
+			Content: frameworkGitignore,
+		},
 	}
 }
+
+// Gitignore for the enclave/ subdirectory — excludes build artifacts and generated files.
+const frameworkGitignore = `# Build artifacts (EIF image + PCR measurements)
+artifacts/
+
+# Generated build config (from enclave.yaml for Nix)
+build-config.json
+
+# CDK outputs (contains account-specific IDs)
+cdk-outputs.json
+cdk.out/
+
+# Nix build symlinks
+result
+result-*
+`
 
 // EIF entrypoint — starts viproxy, nitriding, and the app binary.
 const frameworkStartSh = `#!/bin/sh
