@@ -610,6 +610,10 @@ permissions:
   id-token: write
   contents: read
 
+# Required repo variables:
+#   AWS_ROLE_ARN  - IAM role ARN with OIDC trust policy for this repo
+#   AWS_REGION    - AWS region (e.g. us-east-1)
+
 jobs:
   deploy:
     runs-on: ubuntu-latest
@@ -629,11 +633,17 @@ jobs:
           role-to-assume: ` + "${{ vars.AWS_ROLE_ARN }}" + `
           aws-region: ` + "${{ vars.AWS_REGION }}" + `
 
+      - name: Install AWS CDK
+        run: npm install -g aws-cdk
+
       - name: Pull Nix Docker image
         run: docker pull nixos/nix:2.24.9
 
       - name: Build and deploy
         run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
+          cdk bootstrap aws://${ACCOUNT_ID}/` + "${{ vars.AWS_REGION }}" + `
           enclave build
           enclave deploy
 `

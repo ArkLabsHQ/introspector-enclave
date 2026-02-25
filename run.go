@@ -81,6 +81,7 @@ func runCDKDeploy(cfg *Config, root string) error {
 	return runCmd("cdk", []string{
 		"deploy",
 		"--app", filepath.Join(root, "enclave", "cdk.out"),
+		"--require-approval", "never",
 		"-O", outputsPath,
 	}, root, env)
 }
