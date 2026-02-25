@@ -69,6 +69,11 @@ func getFrameworkFiles() []frameworkFile {
 			Content: frameworkDeployWorkflow,
 		},
 		{
+			RelPath: ".github/workflows/destroy-enclave.yml",
+			Mode:    0644,
+			Content: frameworkDestroyWorkflow,
+		},
+		{
 			RelPath: "enclave/.gitignore",
 			Mode:    0644,
 			Content: frameworkGitignore,
@@ -643,9 +648,51 @@ jobs:
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
-          cdk bootstrap aws://${ACCOUNT_ID}/` + "${{ vars.AWS_REGION }}" + `
           enclave build
           enclave deploy
+`
+
+// GitHub Actions workflow — destroy enclave infrastructure via OIDC-authenticated AWS credentials.
+const frameworkDestroyWorkflow = `name: Destroy Enclave
+
+on:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+# Same repo variables as deploy:
+#   AWS_ROLE_ARN  - IAM role ARN with OIDC trust policy
+#   AWS_REGION    - AWS region
+
+jobs:
+  destroy:
+    runs-on: ubuntu-latest
+    if: vars.AWS_ROLE_ARN != ''
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+
+      - name: Install enclave CLI
+        run: go install github.com/ArkLabsHQ/introspector-enclave/cmd/enclave@latest
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ` + "${{ vars.AWS_ROLE_ARN }}" + `
+          aws-region: ` + "${{ vars.AWS_REGION }}" + `
+
+      - name: Install AWS CDK
+        run: npm install -g aws-cdk
+
+      - name: Destroy stack
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
+          enclave destroy --force
 `
 
 // GitHub Actions workflow — daily attestation verification + GitHub Pages status page.
