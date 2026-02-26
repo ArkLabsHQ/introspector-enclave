@@ -23,7 +23,6 @@ type Config struct {
 	SDK          SDKConfig        `yaml:"sdk"`
 	InstanceType string           `yaml:"instance_type"`
 	NixImage     string           `yaml:"nix_image"`
-	LockKMS      bool             `yaml:"lock_kms"`
 }
 
 type AppConfig struct {
@@ -142,9 +141,6 @@ func (c *Config) configEnv() []string {
 	)
 	if c.Profile != "" {
 		env = append(env, "AWS_PROFILE="+c.Profile)
-	}
-	if c.LockKMS {
-		env = append(env, "LOCK_KMS=1")
 	}
 	return env
 }

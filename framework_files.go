@@ -692,6 +692,10 @@ jobs:
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
+          # CDK stack synthesis references image.eif as an S3 asset, so the path
+          # must exist even for destroy. An empty placeholder is sufficient.
+          mkdir -p enclave/artifacts
+          touch enclave/artifacts/image.eif
           enclave destroy --force
 `
 
