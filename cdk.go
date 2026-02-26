@@ -262,9 +262,12 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	enclaveEif.GrantRead(role)
 	outboundProxyImage.Repository().GrantPull(role)
 	encryptionKey.GrantEncryptDecrypt(role)
-
-	// NOTE: KMS key policy is applied externally by the deploy script using PCR0 from the running enclave.
-	// The EC2 role only needs Encrypt/Decrypt, not PutKeyPolicy.
+	// The enclave self-applies KMS policy using its hardware-attested PCR0.
+	// EC2 role needs PutKeyPolicy + GetKeyPolicy for this self-apply step.
+	encryptionKey.Grant(role,
+		jsii.String("kms:PutKeyPolicy"),
+		jsii.String("kms:GetKeyPolicy"),
+	)
 
 	instance := awsec2.NewInstance(stack, jsii.String("NitroInstance"), &awsec2.InstanceProps{
 		InstanceType: awsec2.NewInstanceType(jsii.String(instanceType)),

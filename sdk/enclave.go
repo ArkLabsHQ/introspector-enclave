@@ -71,6 +71,12 @@ func (e *Enclave) Init(ctx context.Context) error {
 		return fmt.Errorf("generate attestation key: %w", err)
 	}
 
+	e.setInitError("applying KMS policy")
+	if err := selfApplyKMSPolicy(ctx); err != nil {
+		e.setInitError(fmt.Sprintf("apply KMS policy: %s", err))
+		return fmt.Errorf("apply KMS policy: %w", err)
+	}
+
 	if len(secrets) > 0 {
 		e.setInitError("waiting for KMS secrets")
 		if err := e.waitForSecretsFromKMS(ctx, secrets); err != nil {
@@ -127,13 +133,11 @@ func (e *Enclave) AttestationPubkey() string {
 //
 //	GET  /v1/enclave-info
 //	POST /v1/export-key
-//	POST /v1/prepare-upgrade
 //	POST /v1/extend-pcr
 //	POST /v1/lock-pcr
 func (e *Enclave) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /v1/enclave-info", e.handleEnclaveInfo)
 	mux.HandleFunc("POST /v1/export-key", e.handleExportKey)
-	mux.HandleFunc("POST /v1/prepare-upgrade", e.handlePrepareUpgrade)
 	mux.HandleFunc("POST /v1/extend-pcr", e.handleExtendPCR)
 	mux.HandleFunc("POST /v1/lock-pcr", e.handleLockPCR)
 }
@@ -278,7 +282,7 @@ func (e *Enclave) signResponse(body []byte) string {
 
 // handleEnclaveInfo returns build-time and runtime metadata about this enclave.
 // Before init completes, returns 503 with partial state so callers get meaningful
-// JSON instead of 502, while curl -sf health checks still fail (deploy.go lockKMSKey).
+// JSON instead of 502, while curl -sf health checks still fail.
 func (e *Enclave) handleEnclaveInfo(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 

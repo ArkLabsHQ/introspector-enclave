@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -18,9 +17,12 @@ func deployCmd() *cobra.Command {
 		Short: "Deploy or upgrade the enclave",
 		Long: `Deploy a new EIF to a running enclave instance.
 
-Fresh deploy: CDK deploy → apply KMS policy → wait for instance.
-Upgrade (unlocked key): Update KMS policy → upload new EIF → restart.
-Upgrade (locked key): Create temp KMS key → export via enclave API → restart.
+Fresh deploy: CDK deploy → wait for instance → enclave self-applies KMS policy.
+Upgrade: Create new KMS key → export secrets via old enclave → restart → new enclave self-locks.
+
+The enclave applies its own KMS key policy using hardware-attested PCR0 from NSM,
+removing the CLI from the trust chain. The key is automatically locked (no PutKeyPolicy
+for anyone) after each deploy.
 
 Requires 'enclave build' to have been run first (enclave/artifacts/pcr.json and enclave/artifacts/image.eif).`,
 		RunE: runDeploy,
@@ -107,7 +109,8 @@ func runDeploy(cmd *cobra.Command, args []string) error {
 	return deployFresh(ctx, ac, cfg, root, pcr0)
 }
 
-// deployFresh handles first-time deployment: CDK deploy → KMS policy → wait for instance.
+// deployFresh handles first-time deployment: CDK deploy → wait for instance.
+// The enclave self-applies its KMS policy during Init() using hardware-attested PCR0.
 func deployFresh(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0 string) error {
 	// Synthesize and deploy the CDK stack.
 	if err := runCDKDeploy(cfg, root); err != nil {
@@ -121,32 +124,9 @@ func deployFresh(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0 st
 	}
 
 	stack := cfg.stackName()
-	kmsKeyID := outputs.getOutput(stack, "KMSKeyID", "KmsKeyId", "KMS Key ID")
-	if kmsKeyID == "" {
-		return fmt.Errorf("KMSKeyID not found in cdk-outputs.json for %s", stack)
-	}
-	ec2RoleARN := outputs.getOutput(stack, "EC2InstanceRoleARN")
-	if ec2RoleARN == "" {
-		return fmt.Errorf("EC2InstanceRoleARN not found in cdk-outputs.json for %s", stack)
-	}
 	instanceID := outputs.getOutput(stack, "InstanceID", "InstanceId", "Instance ID")
 	if instanceID == "" {
 		return fmt.Errorf("InstanceID not found in cdk-outputs.json for %s", stack)
-	}
-
-	// Wait for KMS key to be enabled.
-	fmt.Printf("[deploy] Waiting for KMS key %s to be enabled...\n", kmsKeyID)
-	for i := 0; i < 60; i++ {
-		keyState, err := ac.getKeyState(ctx, kmsKeyID)
-		if err == nil && keyState == "Enabled" {
-			break
-		}
-		time.Sleep(2 * time.Second)
-	}
-
-	// Apply KMS policy with PCR0.
-	if err := applyKMSPolicy(ctx, ac, kmsKeyID, pcr0, ec2RoleARN, cfg.Account); err != nil {
-		return err
 	}
 
 	// Wait for instance to be ready.
@@ -160,20 +140,15 @@ func deployFresh(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0 st
 	fmt.Println()
 	fmt.Println("[deploy] Done.")
 	fmt.Printf("  Instance ID: %s\n", instanceID)
-	fmt.Printf("  KMS Key ID:  %s\n", kmsKeyID)
 	fmt.Printf("  Elastic IP:  %s\n", elasticIP)
 	fmt.Printf("  PCR0:        %s\n", pcr0)
 	fmt.Println()
 
-	if cfg.LockKMS {
-		return lockKMSKey(ctx, ac, cfg, kmsKeyID, pcr0, ec2RoleARN, instanceID)
-	}
 	return nil
 }
 
-// deployUpgrade handles upgrading an existing enclave. Detects locked/unlocked key
-// and uses the appropriate upgrade path.
-func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0, instanceID, kmsKeyID, ec2RoleARN string) error {
+// deployUpgrade handles upgrading an existing enclave.
+func createUpgradeBucket(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0, instanceID, kmsKeyID, ec2RoleARN string) (string, error) {
 	// Create S3 bucket for EIF transfer (idempotent).
 	eifBucket := cfg.eifBucket()
 	ac.ensureBucket(ctx, eifBucket)
@@ -190,64 +165,34 @@ func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root, pcr0,
 }`, ec2RoleARN, eifBucket)
 
 	if err := ac.putBucketPolicy(ctx, eifBucket, bucketPolicy); err != nil {
-		return fmt.Errorf("set bucket policy: %w", err)
+		return "", fmt.Errorf("set bucket policy: %w", err)
 	}
 
 	// Upload new EIF.
 	eifPath := filepath.Join(root, "enclave", "artifacts", "image.eif")
 	if _, err := os.Stat(eifPath); os.IsNotExist(err) {
-		return fmt.Errorf("enclave/artifacts/image.eif not found. Run 'enclave build' first.")
+		return "", fmt.Errorf("enclave/artifacts/image.eif not found. Run 'enclave build' first.")
 	}
 
 	fmt.Printf("[deploy] Uploading new EIF to s3://%s/image.eif ...\n", eifBucket)
 	if err := ac.uploadFile(ctx, eifBucket, "image.eif", eifPath); err != nil {
-		return fmt.Errorf("upload EIF to S3: %w", err)
+		return "", fmt.Errorf("upload EIF to S3: %w", err)
 	}
 
-	if isKeyLocked(ctx, ac, kmsKeyID) {
-		return deployUpgradeLocked(ctx, ac, cfg, pcr0, instanceID, kmsKeyID, ec2RoleARN, eifBucket)
-	}
-	return deployUpgradeUnlocked(ctx, ac, cfg, pcr0, instanceID, kmsKeyID, ec2RoleARN, eifBucket)
-}
+	return eifBucket, nil
 
-// deployUpgradeUnlocked handles upgrade when the KMS key is unlocked:
-// store old PCR0 → update KMS policy → download EIF on host → restart.
-func deployUpgradeUnlocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0, instanceID, kmsKeyID, ec2RoleARN, eifBucket string) error {
-	fmt.Println("[deploy] KMS key is unlocked — updating policy with new PCR0")
-
-	// Ask old enclave to store its PCR0 + attestation proof in SSM.
-	// The enclave itself generates the NSM attestation document (unforgeable by host).
-	fmt.Println("[deploy] Asking old enclave to store its PCR0 attestation proof...")
-	prepareUpgradeCmd := `curl -sf -k -X POST https://127.0.0.1:443/v1/prepare-upgrade`
-	if err := ac.runOnHost(ctx, instanceID, "prepare-upgrade (store PCR0 attestation)", []string{prepareUpgradeCmd}); err != nil {
-		fmt.Println("[deploy] Warning: could not store PCR0 attestation (chain will show genesis)")
-	}
-
-	// Apply KMS policy with new PCR0 BEFORE restarting the enclave.
-	if err := applyKMSPolicy(ctx, ac, kmsKeyID, pcr0, ec2RoleARN, cfg.Account); err != nil {
-		return err
-	}
-
-	// Download new EIF, stop old enclave, restart watchdog.
-	if err := restartEnclaveOnHost(ctx, ac, cfg, instanceID, eifBucket); err != nil {
-		return err
-	}
-
-	fmt.Println()
-	fmt.Println("[deploy] Upgrade complete.")
-	fmt.Printf("  Instance ID: %s\n", instanceID)
-	fmt.Printf("  KMS Key ID:  %s\n", kmsKeyID)
-	fmt.Printf("  PCR0:        %s\n", pcr0)
-
-	if cfg.LockKMS {
-		return lockKMSKey(ctx, ac, cfg, kmsKeyID, pcr0, ec2RoleARN, instanceID)
-	}
-	return nil
 }
 
 // deployUpgradeLocked handles migration when the KMS key is locked:
 // create temp KMS key → export signing key from old enclave → restart with new key.
-func deployUpgradeLocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0, instanceID, kmsKeyID, ec2RoleARN, eifBucket string) error {
+func deployUpgrade(ctx context.Context, ac *awsClients, cfg *Config, root string, pcr0, instanceID, kmsKeyID, ec2RoleARN string) error {
+	fmt.Println("[deploy] Create Deploy s3 bucket")
+	eifBucket, err := createUpgradeBucket(ctx, ac, cfg, root, pcr0, instanceID, kmsKeyID, ec2RoleARN)
+
+	if err != nil {
+		return err
+	}
+
 	fmt.Println("[deploy] KMS key is locked — using temporary key migration")
 
 	// Step 1: Create new KMS key for the new enclave version.
@@ -258,9 +203,10 @@ func deployUpgradeLocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0,
 	}
 	fmt.Printf("[deploy] Created new KMS key: %s\n", newKMSKeyID)
 
-	// Step 2: Apply policy allowing new enclave to Decrypt.
-	if err := applyKMSPolicy(ctx, ac, newKMSKeyID, pcr0, ec2RoleARN, cfg.Account); err != nil {
-		return fmt.Errorf("apply policy to new KMS key: %w", err)
+	// Step 2: Apply transitional policy — Encrypt + admin (no Decrypt).
+	// The new enclave will self-apply PCR0-restricted Decrypt during Init().
+	if err := applyTransitionalKMSPolicy(ctx, ac, newKMSKeyID, ec2RoleARN, cfg.Account); err != nil {
+		return fmt.Errorf("apply transitional policy to new KMS key: %w", err)
 	}
 
 	// Step 3: Store migration parameters in SSM.
@@ -338,15 +284,11 @@ func deployUpgradeLocked(ctx context.Context, ac *awsClients, cfg *Config, pcr0,
 	}
 
 	fmt.Println()
-	fmt.Println("[deploy] Locked-key migration complete.")
+	fmt.Println("[deploy] Migration complete.")
 	fmt.Printf("  Instance ID:  %s\n", instanceID)
 	fmt.Printf("  New KMS Key:  %s\n", newKMSKeyID)
 	fmt.Printf("  Old KMS Key:  %s (scheduled for deletion by new enclave on boot)\n", kmsKeyID)
 	fmt.Printf("  PCR0:         %s\n", pcr0)
-
-	if cfg.LockKMS {
-		return lockKMSKey(ctx, ac, cfg, newKMSKeyID, pcr0, ec2RoleARN, instanceID)
-	}
 	return nil
 }
 
@@ -366,28 +308,19 @@ func restartEnclaveOnHost(ctx context.Context, ac *awsClients, cfg *Config, inst
 
 // --- KMS policy functions ---
 
-// applyKMSPolicy applies a KMS key policy that allows the enclave (with matching PCR0) to Decrypt
-// and allows the account root to administer (but not Decrypt) the key.
-func applyKMSPolicy(ctx context.Context, ac *awsClients, keyID, pcr0, ec2RoleARN, account string) error {
-	fmt.Printf("[deploy] Applying KMS key policy with PCR0: %s\n", pcr0)
+// applyTransitionalKMSPolicy applies a transitional KMS key policy for locked-key
+// migration. Grants Encrypt to the EC2 role (so the old enclave can re-encrypt
+// secrets to the new key) and admin to the account root (including PutKeyPolicy,
+// so the new enclave can self-apply PCR0-restricted Decrypt during Init).
+// Intentionally omits Decrypt — only the new enclave can add that after proving its PCR0.
+func applyTransitionalKMSPolicy(ctx context.Context, ac *awsClients, keyID, ec2RoleARN, account string) error {
+	fmt.Println("[deploy] Applying transitional KMS key policy (Encrypt + admin, no Decrypt)")
 
 	accountRoot := fmt.Sprintf("arn:aws:iam::%s:root", account)
 
 	policy := fmt.Sprintf(`{
   "Version": "2012-10-17",
   "Statement": [
-    {
-      "Sid": "Enable decrypt from enclave with attestation",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": "kms:Decrypt",
-      "Resource": "*",
-      "Condition": {
-        "StringEqualsIgnoreCase": {
-          "kms:RecipientAttestation:PCR0": %q
-        }
-      }
-    },
     {
       "Sid": "Enable encrypt from enclave",
       "Effect": "Allow",
@@ -416,84 +349,9 @@ func applyKMSPolicy(ctx context.Context, ac *awsClients, keyID, pcr0, ec2RoleARN
       "Resource": "*"
     }
   ]
-}`, ec2RoleARN, pcr0, ec2RoleARN, accountRoot)
+}`, ec2RoleARN, accountRoot)
 
 	return ac.putKeyPolicy(ctx, keyID, policy, false)
-}
-
-// isKeyLocked checks if a KMS key policy lacks PutKeyPolicy (meaning it's locked).
-func isKeyLocked(ctx context.Context, ac *awsClients, keyID string) bool {
-	policy, err := ac.getKeyPolicy(ctx, keyID)
-	if err != nil {
-		return true // assume locked on error
-	}
-	return !strings.Contains(policy, "PutKeyPolicy")
-}
-
-// lockKMSKey locks the KMS key so only the enclave with matching PCR0 can Decrypt.
-// Waits for the enclave to be healthy first.
-func lockKMSKey(ctx context.Context, ac *awsClients, cfg *Config, keyID, pcr0, ec2RoleARN, instanceID string) error {
-	fmt.Println("[deploy] Waiting for enclave to be healthy before locking KMS key...")
-
-	maxWait := 120
-	healthy := false
-	for elapsed := 0; elapsed < maxWait; elapsed += 5 {
-		err := ac.runOnHost(ctx, instanceID, "health check",
-			[]string{"curl -sf -k https://127.0.0.1:443/v1/enclave-info > /dev/null"})
-		if err == nil {
-			fmt.Println("[deploy] Enclave is healthy")
-			healthy = true
-			break
-		}
-		time.Sleep(5 * time.Second)
-	}
-
-	if !healthy {
-		fmt.Printf("[deploy] WARNING: Enclave did not become healthy within %ds\n", maxWait)
-		fmt.Println("[deploy] Skipping KMS lock. Run 'enclave lock' manually.")
-		return fmt.Errorf("enclave not healthy after %ds", maxWait)
-	}
-
-	policy := fmt.Sprintf(`{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Sid": "EnclaveDecryptWithAttestation",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": "kms:Decrypt",
-      "Resource": "*",
-      "Condition": {
-        "StringEqualsIgnoreCase": {
-          "kms:RecipientAttestation:PCR0": %q
-        }
-      }
-    },
-    {
-      "Sid": "EnclaveEncrypt",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": "kms:Encrypt",
-      "Resource": "*"
-    },
-    {
-      "Sid": "AllowKeyDeletion",
-      "Effect": "Allow",
-      "Principal": {"AWS": %q},
-      "Action": "kms:ScheduleKeyDeletion",
-      "Resource": "*"
-    }
-  ]
-}`, ec2RoleARN, pcr0, ec2RoleARN, ec2RoleARN)
-
-	fmt.Printf("[deploy] Locking KMS key %s to PCR0 %s...\n", keyID, pcr0[:16])
-
-	if err := ac.putKeyPolicy(ctx, keyID, policy, true); err != nil {
-		return fmt.Errorf("lock KMS key: %w", err)
-	}
-
-	fmt.Println("[deploy] KMS key locked. Only this enclave image can decrypt.")
-	return nil
 }
 
 // --- File helpers ---

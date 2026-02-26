@@ -155,42 +155,7 @@ func storePCR0WithAttestation(ctx context.Context, ssmClient *ssm.Client, deploy
 	return pcr0, attestDocB64, nil
 }
 
-// handlePrepareUpgrade handles POST /v1/prepare-upgrade.
-// Generates an NSM attestation document and stores both the plain PCR0
-// and the attestation document in SSM. Called by the CLI before upgrading
-// an unlocked enclave, so the enclave itself writes its own PCR0 proof.
-func (e *Enclave) handlePrepareUpgrade(w http.ResponseWriter, r *http.Request) {
-	if !e.initDone.Load() {
-		http.Error(w, "enclave is still initializing", http.StatusServiceUnavailable)
-		return
-	}
 
-	ctx := r.Context()
-	deployment := getDeployment()
-	appName := getAppName()
-
-	awsCfg, err := loadAWSConfigWithIMDS(ctx)
-	if err != nil {
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	ssmClient := ssm.NewFromConfig(awsCfg)
-
-	pcr0, attestDocB64, err := storePCR0WithAttestation(ctx, ssmClient, deployment, appName)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(struct {
-		PCR0        string `json:"pcr0"`
-		Attestation string `json:"attestation,omitempty"`
-	}{
-		PCR0:        pcr0,
-		Attestation: attestDocB64,
-	})
-}
 
 // deleteOldKMSKey checks if MigrationOldKMSKeyID is set in SSM. If so,
 // schedules the old KMS key for deletion and clears the parameter.
