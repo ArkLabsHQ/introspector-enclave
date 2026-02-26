@@ -35,30 +35,29 @@ func selfApplyKMSPolicy(ctx context.Context) error {
 		return fmt.Errorf("get KMS key ID: %w", err)
 	}
 
-	// Check if key is already locked (no PutKeyPolicy in current policy).
-	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
-		KeyId: aws.String(keyID),
-	})
-	if err != nil {
-		// If we can't read the policy, the key may be locked. Skip silently.
-		log.Printf("kms_policy: cannot read current policy (key may be locked): %v", err)
-		return nil
-	}
-	if currentPolicy.Policy == nil || !strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") {
-		log.Println("kms_policy: key is locked, skipping self-apply")
-		return nil
-	}
-
 	// Get own PCR0 from NSM hardware.
 	pcr0 := getPCR0()
 	if pcr0 == "" {
 		return fmt.Errorf("could not read PCR0 from NSM")
 	}
 
-	// Check if policy already has this PCR0 (idempotent on reboot).
-	if strings.Contains(*currentPolicy.Policy, pcr0) {
+	// Read current key policy to determine state.
+	currentPolicy, err := kmsClient.GetKeyPolicy(ctx, &kms.GetKeyPolicyInput{
+		KeyId: aws.String(keyID),
+	})
+	if err != nil {
+		return fmt.Errorf("get current KMS key policy: %w", err)
+	}
+
+	// Check if policy already has this PCR0 — nothing to do.
+	if currentPolicy.Policy != nil && strings.Contains(*currentPolicy.Policy, pcr0) {
 		log.Printf("kms_policy: policy already contains PCR0 %s..., skipping", pcr0[:16])
 		return nil
+	}
+
+	// PCR0 not in policy. Check if we can modify it.
+	if currentPolicy.Policy == nil || !strings.Contains(*currentPolicy.Policy, "PutKeyPolicy") {
+		return fmt.Errorf("KMS key is locked to a different PCR0 (this enclave: %s...)", pcr0[:16])
 	}
 
 	// Get caller identity for role ARN and account ID.
@@ -119,7 +118,8 @@ func assumedRoleARNToRoleARN(arn string) (string, error) {
 }
 
 // buildKMSPolicy builds a locked KMS key policy: Decrypt is restricted to the
-// enclave's PCR0 via attestation, Encrypt is unrestricted for the EC2 role,
+// enclave's PCR0 via attestation, Encrypt/GenerateDataKey are unrestricted for
+// the EC2 role, GetKeyPolicy allows the enclave to verify the lock on reboot,
 // and ScheduleKeyDeletion is allowed for old-key cleanup during migration.
 // No PutKeyPolicy is granted to anyone — the key is immutably locked to this PCR0.
 func buildKMSPolicy(ec2RoleARN, pcr0 string) string {
@@ -139,10 +139,10 @@ func buildKMSPolicy(ec2RoleARN, pcr0 string) string {
       }
     },
     {
-      "Sid": "EnclaveEncrypt",
+      "Sid": "EnclaveOperations",
       "Effect": "Allow",
       "Principal": {"AWS": %q},
-      "Action": "kms:Encrypt",
+      "Action": ["kms:Encrypt", "kms:GetKeyPolicy"],
       "Resource": "*"
     },
     {

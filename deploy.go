@@ -309,10 +309,13 @@ func restartEnclaveOnHost(ctx context.Context, ac *awsClients, cfg *Config, inst
 // --- KMS policy functions ---
 
 // applyTransitionalKMSPolicy applies a transitional KMS key policy for locked-key
-// migration. Grants Encrypt to the EC2 role (so the old enclave can re-encrypt
-// secrets to the new key) and admin to the account root (including PutKeyPolicy,
-// so the new enclave can self-apply PCR0-restricted Decrypt during Init).
+// migration. Grants Encrypt + self-apply permissions to the EC2 role (so the new
+// enclave can call PutKeyPolicy to add PCR0-restricted Decrypt during Init), and
+// admin to the account root.
 // Intentionally omits Decrypt — only the new enclave can add that after proving its PCR0.
+//
+// The EC2 role needs PutKeyPolicy and GetKeyPolicy granted directly in the key
+// policy because its IAM policy is scoped to the old CDK-managed key ARN.
 func applyTransitionalKMSPolicy(ctx context.Context, ac *awsClients, keyID, ec2RoleARN, account string) error {
 	fmt.Println("[deploy] Applying transitional KMS key policy (Encrypt + admin, no Decrypt)")
 
@@ -322,10 +325,14 @@ func applyTransitionalKMSPolicy(ctx context.Context, ac *awsClients, keyID, ec2R
   "Version": "2012-10-17",
   "Statement": [
     {
-      "Sid": "Enable encrypt from enclave",
+      "Sid": "Enable encrypt and self-apply from enclave",
       "Effect": "Allow",
       "Principal": {"AWS": %q},
-      "Action": "kms:Encrypt",
+      "Action": [
+        "kms:Encrypt",
+        "kms:GetKeyPolicy",
+        "kms:PutKeyPolicy"
+      ],
       "Resource": "*"
     },
     {
