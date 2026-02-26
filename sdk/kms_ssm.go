@@ -2,7 +2,6 @@ package sdk
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
@@ -91,40 +90,24 @@ func initializeOrLoadSecret(ctx context.Context, secret SecretDef) error {
 	return decryptExistingSecret(ctx, kmsClient, keyID, ciphertextB64, secret.EnvVar)
 }
 
-// generateAndStoreSecret generates 32 random bytes, encrypts with KMS,
-// extracts PCR0 from attestation, and stores ciphertext in SSM.
+// generateAndStoreSecret uses KMS GenerateDataKey to produce a 32-byte
+// secret with KMS hardware RNG, and stores the ciphertext in SSM.
 func generateAndStoreSecret(ctx context.Context, kmsClient *kms.Client, ssmClient *ssm.Client, keyID, paramName, envVar string) error {
-	secretBytes := make([]byte, 32)
-	if _, err := rand.Read(secretBytes); err != nil {
-		return fmt.Errorf("generate random bytes: %w", err)
+	out, err := kmsClient.GenerateDataKey(ctx, &kms.GenerateDataKeyInput{
+		KeyId:         aws.String(keyID),
+		NumberOfBytes: aws.Int32(32),
+	})
+	if err != nil {
+		return fmt.Errorf("kms generate data key: %w", err)
 	}
 
-	ciphertextB64, err := encryptWithKMS(ctx, kmsClient, keyID, secretBytes)
-	if err != nil {
-		return err
-	}
-
-	session, err := nsm.OpenDefaultSession()
-	if err != nil {
-		return fmt.Errorf("open nsm session: %w", err)
-	}
-	defer session.Close()
-
-	attestationDoc, _, err := buildAttestationDocument(session)
-	if err != nil {
-		return err
-	}
-
-	_, err = extractPCR0FromAttestation(attestationDoc)
-	if err != nil {
-		return err
-	}
+	ciphertextB64 := base64.StdEncoding.EncodeToString(out.CiphertextBlob)
 
 	if err := storeCiphertextInSSM(ctx, ssmClient, paramName, ciphertextB64); err != nil {
 		return err
 	}
 
-	secretHex := hex.EncodeToString(secretBytes)
+	secretHex := hex.EncodeToString(out.Plaintext)
 	if err := os.Setenv(envVar, secretHex); err != nil {
 		return fmt.Errorf("set %s: %w", envVar, err)
 	}
