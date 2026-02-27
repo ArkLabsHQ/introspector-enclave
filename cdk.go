@@ -264,10 +264,18 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	encryptionKey.GrantEncryptDecrypt(role)
 	// The enclave self-applies KMS policy using its hardware-attested PCR0.
 	// EC2 role needs PutKeyPolicy + GetKeyPolicy for this self-apply step.
+	// These are granted both via IAM (Grant) and directly in the key policy
+	// (AddToResourcePolicy) so the enclave can detect "PutKeyPolicy" in the
+	// key policy string during selfApplyKMSPolicy().
 	encryptionKey.Grant(role,
 		jsii.String("kms:PutKeyPolicy"),
 		jsii.String("kms:GetKeyPolicy"),
 	)
+	encryptionKey.AddToResourcePolicy(awsiam.NewPolicyStatement(&awsiam.PolicyStatementProps{
+		Actions:    jsii.Strings("kms:PutKeyPolicy", "kms:GetKeyPolicy"),
+		Resources:  jsii.Strings("*"),
+		Principals: &[]awsiam.IPrincipal{role},
+	}), jsii.Bool(true))
 
 	instance := awsec2.NewInstance(stack, jsii.String("NitroInstance"), &awsec2.InstanceProps{
 		InstanceType: awsec2.NewInstanceType(jsii.String(instanceType)),
@@ -333,4 +341,3 @@ func ReadFileOrPanic(path string) string {
 	}
 	return string(data)
 }
-
