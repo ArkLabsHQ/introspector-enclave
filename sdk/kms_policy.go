@@ -142,7 +142,7 @@ func buildKMSPolicy(ec2RoleARN, pcr0 string) string {
       "Sid": "EnclaveOperations",
       "Effect": "Allow",
       "Principal": {"AWS": %q},
-      "Action": ["kms:Encrypt", "kms:GetKeyPolicy"],
+      "Action": ["kms:Encrypt", "kms:GetKeyPolicy", "kms:GenerateDataKey"],
       "Resource": "*"
     },
     {
