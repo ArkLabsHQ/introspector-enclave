@@ -58,7 +58,11 @@ func NewNitroIntrospectorStack(scope constructs.Construct, id string, props *Nit
 	encryptionKey := awskms.NewKey(stack, jsii.String("EncryptionKey"), &awskms.KeyProps{
 		EnableKeyRotation: jsii.Bool(true),
 	})
-	encryptionKey.ApplyRemovalPolicy(awscdk.RemovalPolicy_DESTROY)
+	// Retain the KMS key on stack deletion. The key is locked to the enclave's
+	// PCR0 after first boot (no PutKeyPolicy for anyone), so CDK cannot call
+	// ScheduleKeyDeletion. The destroy command handles key deletion via the
+	// EC2 instance role before tearing down the stack.
+	encryptionKey.ApplyRemovalPolicy(awscdk.RemovalPolicy_RETAIN)
 
 	outboundProxyImage := awsecrassets.NewDockerImageAsset(stack, jsii.String("gvproxy"), &awsecrassets.DockerImageAssetProps{
 		Directory: jsii.String(repoRoot),
