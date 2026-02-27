@@ -27,6 +27,7 @@ func Execute() {
 		verifyCmd(),
 		statusCmd(),
 		destroyCmd(),
+		generateCmd(),
 	)
 
 	if err := rootCmd.Execute(); err != nil {
