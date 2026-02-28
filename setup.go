@@ -23,10 +23,14 @@ nix_hash, and nix_vendor_hash, and updates enclave/enclave.yaml.
 By default, runs hash computation inside a Docker container (same nixos
 image as 'enclave build'). Use --local to use the host nix installation.
 
+Use --language to set the app language and generate the correct flake.nix.
+Supported languages: go (default), nodejs.
+
 All hashes are computed from the local git repo — no fetch from GitHub.`,
 		RunE: runSetup,
 	}
 	cmd.Flags().Bool("local", false, "Use local Nix instead of Docker")
+	cmd.Flags().String("language", "", "Set app language: go, nodejs")
 	return cmd
 }
 
@@ -37,6 +41,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	}
 
 	local, _ := cmd.Flags().GetBool("local")
+	languageFlag, _ := cmd.Flags().GetString("language")
 
 	// 1. Detect owner/repo from git remote.
 	owner, repo, err := detectGitRemote(root)
@@ -57,6 +62,45 @@ func runSetup(cmd *cobra.Command, args []string) error {
 	if err != nil {
 		return err
 	}
+
+	// If --language flag is provided, update config and rewrite flake.nix.
+	language := cfg.App.Language
+	if languageFlag != "" {
+		switch languageFlag {
+		case "go", "nodejs":
+			language = languageFlag
+		default:
+			return fmt.Errorf("unsupported language: %s (supported: go, nodejs)", languageFlag)
+		}
+	}
+
+	// Update language in enclave.yaml if changed.
+	if language != cfg.App.Language || languageFlag != "" {
+		cfgPath := filepath.Join(root, configFile)
+		data, err := os.ReadFile(cfgPath)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", configFile, err)
+		}
+		content := string(data)
+		content = replaceYAMLValue(content, "language", language)
+		if err := os.WriteFile(cfgPath, []byte(content), 0644); err != nil {
+			return fmt.Errorf("write %s: %w", configFile, err)
+		}
+		fmt.Printf("[setup] Set language: %s\n", language)
+	}
+
+	// Rewrite flake.nix to match the language.
+	for _, f := range getFrameworkFiles(language) {
+		if f.RelPath == "flake.nix" {
+			destPath := filepath.Join(root, f.RelPath)
+			if err := os.WriteFile(destPath, []byte(f.Content), f.Mode); err != nil {
+				return fmt.Errorf("write %s: %w", f.RelPath, err)
+			}
+			fmt.Printf("[setup] Wrote %s for %s\n", f.RelPath, language)
+			break
+		}
+	}
+
 	subPackages := cfg.App.NixSubPackages
 	if len(subPackages) == 0 {
 		subPackages = []string{"."}
@@ -79,9 +123,9 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		}
 		fmt.Printf("[setup] nix_hash: %s\n", nixHash)
 
-		// 4. Compute vendor hash via trial nix build.
-		fmt.Println("[setup] Computing vendor hash (local trial nix build)...")
-		vendorHash, vendorErr = computeVendorHash(root, subPackages)
+		// 4. Compute vendor/deps hash via trial nix build.
+		fmt.Println("[setup] Computing deps hash (local trial nix build)...")
+		vendorHash, vendorErr = computeVendorHash(root, subPackages, language)
 	} else {
 		// Docker mode: run both hash computations inside the nix container.
 		nixImage := cfg.NixImage
@@ -90,7 +134,7 @@ func runSetup(cmd *cobra.Command, args []string) error {
 		}
 
 		fmt.Printf("[setup] Computing hashes in Docker (%s)...\n", nixImage)
-		nixHash, vendorHash, vendorErr = computeHashesDocker(root, rev, subPackages, nixImage)
+		nixHash, vendorHash, vendorErr = computeHashesDocker(root, rev, subPackages, nixImage, language)
 		if nixHash == "" && vendorErr != nil {
 			return vendorErr
 		}
@@ -146,15 +190,29 @@ func runSetup(cmd *cobra.Command, args []string) error {
 // computeHashesDocker runs nix hash + vendor hash computation inside a Docker
 // container using the same nixos image as 'enclave build'.
 // Results are written to .enclave-setup-result in the mounted directory.
-func computeHashesDocker(root, rev string, subPackages []string, nixImage string) (nixHash, vendorHash string, err error) {
-	// Build sub-packages as Nix list: [ "." "cmd/foo" ]
-	var nixPkgs []string
-	for _, p := range subPackages {
-		nixPkgs = append(nixPkgs, fmt.Sprintf(`\"%s\"`, p))
-	}
-	nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
-
+func computeHashesDocker(root, rev string, subPackages []string, nixImage string, language string) (nixHash, vendorHash string, err error) {
 	resultFile := ".enclave-setup-result"
+
+	// Build the language-specific trial build expression.
+	var trialBuildExpr string
+	switch language {
+	case "nodejs":
+		trialBuildExpr = `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
+    pname = "app"; version = "dev"; src = ./.;
+    npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
+  }`
+	default: // "go"
+		var nixPkgs []string
+		for _, p := range subPackages {
+			nixPkgs = append(nixPkgs, fmt.Sprintf(`\"%s\"`, p))
+		}
+		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
+		trialBuildExpr = fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
+    pname = "app"; version = "dev"; src = ./.;
+    subPackages = %s; vendorHash = "";
+    env.CGO_ENABLED = "0"; doCheck = false;
+  }`, nixSubPkgs)
+	}
 
 	// Shell script that runs inside the container.
 	// Writes results to a file in the mounted volume so the host can read them.
@@ -168,21 +226,17 @@ SOURCE_HASH=$(nix hash path "$TMPDIR/source")
 rm -rf "$TMPDIR"
 echo "nix_hash=$SOURCE_HASH" > /src/%s
 
-# Compute vendor hash via trial build
+# Compute deps hash via trial build
 VENDOR_OUTPUT=$(nix build --impure --no-link \
   --extra-experimental-features 'nix-command flakes' \
-  --expr 'let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
-    pname = "app"; version = "dev"; src = ./.;
-    subPackages = %s; vendorHash = "";
-    env.CGO_ENABLED = "0"; doCheck = false;
-  }' 2>&1 || true)
+  --expr '%s' 2>&1 || true)
 VENDOR_HASH=$(echo "$VENDOR_OUTPUT" | grep 'got:' | awk '{print $2}')
 if [ -n "$VENDOR_HASH" ]; then
   echo "vendor_hash=$VENDOR_HASH" >> /src/%s
 else
-  echo "vendor_err=Could not extract vendor hash" >> /src/%s
+  echo "vendor_err=Could not extract deps hash" >> /src/%s
 fi
-`, rev, resultFile, nixSubPkgs, resultFile, resultFile)
+`, rev, resultFile, trialBuildExpr, resultFile, resultFile)
 
 	// Run inside Docker using the existing runContainer function.
 	if err := runContainer(context.Background(), nixImage, script, root, "/src", nil); err != nil {
@@ -313,21 +367,29 @@ func computeNixHash(root string, rev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
-// computeVendorHash runs a trial nix build with empty vendorHash to discover
-// the expected Go vendor hash. It parses the "got:" line from the error output.
-func computeVendorHash(root string, subPackages []string) (string, error) {
-	// Build the subPackages as a Nix list string: [ "." "cmd/foo" ]
-	var nixPkgs []string
-	for _, p := range subPackages {
-		nixPkgs = append(nixPkgs, fmt.Sprintf("%q", p))
-	}
-	nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
-
-	expr := fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
+// computeVendorHash runs a trial nix build with an empty deps hash to discover
+// the expected hash. It parses the "got:" line from the error output.
+// For Go, this is the vendor hash; for Node.js, the npm deps hash.
+func computeVendorHash(root string, subPackages []string, language string) (string, error) {
+	var expr string
+	switch language {
+	case "nodejs":
+		expr = `let pkgs = import <nixpkgs> {}; in pkgs.buildNpmPackage {
+  pname = "app"; version = "dev"; src = ./.;
+  npmDepsHash = ""; dontNpmBuild = true; doCheck = false;
+}`
+	default: // "go"
+		var nixPkgs []string
+		for _, p := range subPackages {
+			nixPkgs = append(nixPkgs, fmt.Sprintf("%q", p))
+		}
+		nixSubPkgs := "[ " + strings.Join(nixPkgs, " ") + " ]"
+		expr = fmt.Sprintf(`let pkgs = import <nixpkgs> {}; in pkgs.buildGoModule {
   pname = "app"; version = "dev"; src = ./.;
   subPackages = %s; vendorHash = "";
   env.CGO_ENABLED = "0"; doCheck = false;
 }`, nixSubPkgs)
+	}
 
 	cmd := exec.Command("nix", "build",
 		"--impure",

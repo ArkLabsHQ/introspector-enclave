@@ -1,6 +1,6 @@
 # Introspector Enclave
 
-A framework for running Go applications inside [AWS Nitro Enclaves](https://aws.amazon.com/ec2/nitro/nitro-enclaves/) with zero SDK imports. The enclave supervisor handles attestation, KMS secret management, PCR extension, and BIP-340 Schnorr response signing automatically. You write a plain Go HTTP server.
+A framework for running applications inside [AWS Nitro Enclaves](https://aws.amazon.com/ec2/nitro/nitro-enclaves/) with zero SDK imports. Supports **Go** and **Node.js**. The enclave supervisor handles attestation, KMS secret management, PCR extension, and BIP-340 Schnorr response signing automatically. You write a plain HTTP server.
 
 ## Architecture
 
@@ -43,14 +43,22 @@ The enclave uses [gvproxy](https://github.com/containers/gvisor-tap-vsock) for o
 - `192.168.127.2` - Enclave's virtual IP
 - `127.0.0.1:80` - IMDS endpoint (via viproxy -> vsock CID 3:8002)
 
+## Supported Languages
+
+| Language | App Template | Build System | Dependency Hash |
+|----------|-------------|-------------|----------------|
+| **Go** | `enclave generate template --golang` | `buildGoModule` | `vendorHash` (from `go.sum`) |
+| **Node.js** | `enclave generate template --nodejs` | `buildNpmPackage` | `npmDepsHash` (from `package-lock.json`) |
+
 ## Prerequisites
 
-- Go 1.22+
 - Docker (for reproducible EIF builds via pinned NixOS container)
 - [Nix](https://nixos.org/) (for hash computation and local builds)
 - AWS CLI v2 with appropriate credentials
 - AWS CDK CLI (`npm install -g aws-cdk`)
 - `jq`
+- **Go apps:** Go 1.22+
+- **Node.js apps:** Node.js 22+
 
 ## Quick Start
 
@@ -70,15 +78,22 @@ make build                    # build CLI with hashes baked in
 
 ### 2. Initialize your project
 
-In your Go app's repo root:
+**Option A:** Generate a complete template (recommended for new projects):
+
+```sh
+enclave generate template --golang my-app    # Go project
+enclave generate template --nodejs my-app    # Node.js project
+```
+
+**Option B:** Add enclave support to an existing repo:
 
 ```sh
 enclave init
 ```
 
-This creates:
+Both create:
 - `enclave/enclave.yaml` — main config file
-- `flake.nix` — Nix build definition
+- `flake.nix` — Nix build definition (language-specific)
 - `enclave/start.sh` — enclave boot script
 - `enclave/gvproxy/` — network proxy config
 - `enclave/scripts/` — initialization scripts
@@ -92,11 +107,14 @@ If built with `make build`, the `sdk:` section is auto-populated with the correc
 The `setup` command auto-detects your GitHub remote and computes all nix hashes:
 
 ```sh
-enclave setup              # runs in Docker (recommended)
-enclave setup --local      # uses local nix installation
+enclave setup                          # Go app (default), runs in Docker
+enclave setup --language nodejs        # Node.js app (writes correct flake.nix)
+enclave setup --local                  # uses local nix installation
 ```
 
 This populates `nix_owner`, `nix_repo`, `nix_rev`, `nix_hash`, and `nix_vendor_hash` in `enclave/enclave.yaml` from your local git state.
+
+> **Node.js:** `package-lock.json` must be committed to your repo. Nix requires it to compute reproducible dependency hashes.
 
 ### 4. Configure `enclave/enclave.yaml`
 
@@ -113,13 +131,14 @@ sdk:
   vendor_hash: "sha256-..."
 
 app:
+  language: go                   # "go" or "nodejs"
   nix_owner: my-org              # auto-populated by 'enclave setup'
   nix_repo: my-app
   nix_rev: "abc123..."
   nix_hash: "sha256-..."
-  nix_vendor_hash: "sha256-..."
+  nix_vendor_hash: "sha256-..."  # Go vendor hash or npm deps hash
   nix_sub_packages:
-    - "cmd"                      # Go sub-package with main()
+    - "cmd"                      # Go sub-package with main() (Go only)
   binary_name: my-app
 
   env:
@@ -131,8 +150,9 @@ secrets:
     env_var: APP_SIGNING_KEY
 ```
 
-Your app is a plain Go HTTP server — no SDK imports needed:
+Your app is a plain HTTP server — no SDK imports needed:
 
+**Go:**
 ```go
 package main
 
@@ -150,6 +170,18 @@ func main() {
     })
     http.ListenAndServe(":"+port, nil)
 }
+```
+
+**Node.js:**
+```js
+const http = require("http");
+const port = process.env.ENCLAVE_APP_PORT || "7074";
+const signingKey = process.env.APP_SIGNING_KEY; // decrypted by supervisor
+
+http.createServer((req, res) => {
+  res.writeHead(200, { "Content-Type": "text/plain" });
+  res.end("Hello from the enclave\n");
+}).listen(port, () => console.log(`listening on :${port}`));
 ```
 
 ### 5. Validate config
@@ -183,16 +215,22 @@ enclave verify             # verify attestation document + PCR0 match
 
 ## Updating Your App
 
-When you push new code to your app repo:
+The enclave build fetches your app source from GitHub at the exact commit specified in `enclave.yaml`. Code must be committed and pushed before building.
+
+**Code-only changes (no new dependencies):**
 
 ```sh
-# 1. Commit and push your changes
 git add . && git commit -m "update" && git push
+enclave update     # fast: updates nix_rev + nix_hash only (~1 second)
+enclave build
+enclave deploy
+```
 
-# 2. Re-run setup to update hashes
-enclave setup
+**Dependency changes (go.mod/go.sum or package.json/package-lock.json):**
 
-# 3. Rebuild and redeploy
+```sh
+git add . && git commit -m "update deps" && git push
+enclave setup      # full: recomputes all hashes including vendor/deps hash
 enclave build
 enclave deploy
 ```
@@ -237,14 +275,17 @@ The `.github/workflows/sdk-hashes.yml` workflow runs on tag push (`v*`) to verif
 | Command | Description |
 |---------|-------------|
 | `enclave init` | Scaffold enclave project or validate existing config |
+| `enclave generate template --golang` | Generate a complete Go enclave app template |
+| `enclave generate template --nodejs` | Generate a complete Node.js enclave app template |
 | `enclave setup` | Auto-populate app nix hashes from git remote |
-| `enclave setup --local` | Same as above, using local Nix instead of Docker |
+| `enclave setup --language nodejs` | Set language and rewrite flake.nix for Node.js |
+| `enclave setup --local` | Use local Nix instead of Docker for hash computation |
+| `enclave update` | Fast update: only nix_rev + nix_hash (code changes, no dep changes) |
 | `enclave build` | Build EIF image (reproducible, via Docker + Nix) |
 | `enclave build --local` | Build EIF using local Nix instead of Docker |
 | `enclave deploy` | Deploy CDK stack (VPC, EC2, KMS, IAM, secrets) |
 | `enclave verify` | Verify attestation document and PCR0 against local build |
 | `enclave status` | Show deployment status |
-| `enclave lock` | Irreversible KMS lockdown (PCR0-only decrypt) |
 | `enclave destroy` | Tear down the CDK stack |
 
 ## API Endpoints
@@ -366,6 +407,8 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 ├── config.go                    # Config loading + validation
 ├── build.go                     # EIF build orchestration
 ├── setup.go                     # Auto-populate app nix hashes
+├── update.go                    # Fast update (rev + source hash only)
+├── template.go                  # Template generation (Go, Node.js)
 ├── deploy.go                    # CDK deploy + secret provisioning
 ├── verify.go                    # Attestation verification
 ├── cdk.go                       # AWS CDK stack definition (Go)
@@ -401,13 +444,14 @@ The enclave image is built entirely with [Nix](https://nixos.org/) using [monzo/
 | `sdk.rev` | SDK git commit SHA or tag | (required for build) |
 | `sdk.hash` | Nix source hash (SRI) | (required for build) |
 | `sdk.vendor_hash` | Go vendor hash (SRI) | (required for build) |
+| `app.language` | App language (`go`, `nodejs`) | `go` |
 | `app.source` | Build source type | `nix` |
 | `app.nix_owner` | GitHub owner | (auto by `setup`) |
 | `app.nix_repo` | GitHub repo | (auto by `setup`) |
 | `app.nix_rev` | Git commit SHA | (auto by `setup`) |
 | `app.nix_hash` | Nix source hash (SRI) | (auto by `setup`) |
-| `app.nix_vendor_hash` | Go vendor hash (SRI) | (auto by `setup`) |
-| `app.nix_sub_packages` | Go sub-packages to build | `["."]` |
+| `app.nix_vendor_hash` | Go vendor hash or npm deps hash (SRI) | (auto by `setup`) |
+| `app.nix_sub_packages` | Go sub-packages to build (Go only) | `["."]` |
 | `app.binary_name` | Output binary name | `{name}` |
 | `app.env` | Environment variables baked into EIF | `{}` |
 | `secrets[].name` | Secret name (SSM path component) | (required) |

@@ -22,6 +22,7 @@ func Execute() {
 	rootCmd.AddCommand(
 		initCmd(),
 		setupCmd(),
+		updateCmd(),
 		buildCmd(),
 		deployCmd(),
 		verifyCmd(),

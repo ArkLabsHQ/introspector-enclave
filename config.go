@@ -26,6 +26,7 @@ type Config struct {
 }
 
 type AppConfig struct {
+	Language       string            `yaml:"language"`
 	Source         string            `yaml:"source"`
 	NixOwner       string            `yaml:"nix_owner"`
 	NixRepo        string            `yaml:"nix_repo"`
@@ -82,6 +83,9 @@ func loadConfig() (*Config, error) {
 	}
 	if cfg.App.Source == "" {
 		cfg.App.Source = "nix"
+	}
+	if cfg.App.Language == "" {
+		cfg.App.Language = "go"
 	}
 	// Validate required fields.
 	if cfg.Region == "" {

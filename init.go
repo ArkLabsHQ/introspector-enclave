@@ -29,10 +29,11 @@ sdk:
   vendor_hash: ""                # Go vendor hash (required)
 
 app:
+  language: "go"                 # App language: go, nodejs
   source: nix                    # "nix" = fetch from GitHub via Nix
 
   # GitHub coordinates for the app to run inside the enclave.
-  # Your app is a normal Go HTTP server that listens on ENCLAVE_APP_PORT (default 7074).
+  # Your app is a plain HTTP server that listens on ENCLAVE_APP_PORT (default 7074).
   # Secrets are passed as environment variables. No SDK imports needed.
   nix_owner: ""                  # GitHub owner (required)
   nix_repo: ""                   # GitHub repo name (required)
@@ -103,7 +104,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 		fmt.Printf("Created %s\n", configFile)
 
 		// Write framework files (gvproxy, systemd units, scripts, user_data, start.sh).
-		for _, f := range getFrameworkFiles() {
+		for _, f := range getFrameworkFiles("go") {
 			destPath := filepath.Join(cwd, f.RelPath)
 			if err := os.MkdirAll(filepath.Dir(destPath), 0755); err != nil {
 				return fmt.Errorf("create directory for %s: %w", f.RelPath, err)
@@ -116,8 +117,9 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 		fmt.Println()
 		fmt.Println("Edit enclave/enclave.yaml with your app and SDK details.")
-		fmt.Println("Your app is a plain Go HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
+		fmt.Println("Your app is a plain HTTP server listening on ENCLAVE_APP_PORT (default 7074).")
 		fmt.Println("No SDK imports needed — the supervisor handles attestation automatically.")
+		fmt.Println("Set 'app.language' to your language (go, nodejs) and run 'enclave setup --language <lang>'.")
 		fmt.Println("Then run 'enclave init' again to validate.")
 		return nil
 	}
@@ -179,6 +181,7 @@ func runInit(cmd *cobra.Command, args []string) error {
 	fmt.Println()
 	fmt.Printf("  SDK Rev:     %.12s\n", cfg.SDK.Rev)
 	fmt.Println()
+	fmt.Printf("  Language:    %s\n", cfg.App.Language)
 	fmt.Printf("  App Source:  %s\n", cfg.App.Source)
 	fmt.Printf("  App Repo:    %s/%s\n", cfg.App.NixOwner, cfg.App.NixRepo)
 	fmt.Printf("  App Rev:     %s\n", cfg.App.NixRev)

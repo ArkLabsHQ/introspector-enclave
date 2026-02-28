@@ -41,6 +41,7 @@ type buildConfigJSON struct {
 }
 
 type buildConfigAppJSON struct {
+	Language       string            `json:"language"`
 	NixOwner       string            `json:"nix_owner"`
 	NixRepo        string            `json:"nix_repo"`
 	NixRev         string            `json:"nix_rev"`
@@ -150,6 +151,7 @@ func generateBuildConfig(cfg *Config, root string) error {
 		Region:  cfg.Region,
 		Prefix:  cfg.Prefix,
 		App: buildConfigAppJSON{
+			Language:       cfg.App.Language,
 			NixOwner:       cfg.App.NixOwner,
 			NixRepo:        cfg.App.NixRepo,
 			NixRev:         cfg.App.NixRev,
