@@ -822,7 +822,7 @@ on:
 
 permissions:
   id-token: write
-  contents: read
+  contents: write
 
 # Required repo variables:
 #   AWS_ROLE_ARN  - IAM role ARN with OIDC trust policy for this repo
@@ -854,11 +854,70 @@ jobs:
         run: docker pull nixos/nix:2.24.9
 
       - name: Build and deploy
+        id: deploy
         run: |
           ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
           sed -i "s/^account: .*/account: \"${ACCOUNT_ID}\"/" enclave/enclave.yaml
           enclave build
           enclave deploy
+
+          # Extract deployment outputs for manifest.
+          pcr0=$(jq -r '.PCR0' enclave/artifacts/pcr.json)
+          pcr1=$(jq -r '.PCR1' enclave/artifacts/pcr.json)
+          pcr2=$(jq -r '.PCR2' enclave/artifacts/pcr.json)
+          echo "pcr0=${pcr0}" >> "$GITHUB_OUTPUT"
+          echo "pcr1=${pcr1}" >> "$GITHUB_OUTPUT"
+          echo "pcr2=${pcr2}" >> "$GITHUB_OUTPUT"
+
+          # Extract Elastic IP from CDK outputs.
+          elastic_ip=$(jq -r 'to_entries[0].value | .["ElasticIP"] // .["Elastic IP"] // empty' enclave/cdk-outputs.json)
+          echo "elastic_ip=${elastic_ip}" >> "$GITHUB_OUTPUT"
+
+      - name: Publish deployment manifest
+        if: steps.deploy.outputs.elastic_ip != ''
+        env:
+          PCR0: ` + "${{ steps.deploy.outputs.pcr0 }}" + `
+          PCR1: ` + "${{ steps.deploy.outputs.pcr1 }}" + `
+          PCR2: ` + "${{ steps.deploy.outputs.pcr2 }}" + `
+          ELASTIC_IP: ` + "${{ steps.deploy.outputs.elastic_ip }}" + `
+          REPO: ` + "${{ github.repository }}" + `
+          COMMIT_SHA: ` + "${{ github.sha }}" + `
+          GH_TOKEN: ` + "${{ github.token }}" + `
+        run: |
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          TAG="deploy-$(date -u +%Y%m%d-%H%M%S)"
+
+          jq -n \
+            --arg base_url "https://${ELASTIC_IP}" \
+            --arg pcr0 "$PCR0" \
+            --arg pcr1 "$PCR1" \
+            --arg pcr2 "$PCR2" \
+            --arg timestamp "$TIMESTAMP" \
+            --arg commit "$COMMIT_SHA" \
+            --arg repo "$REPO" \
+            '{base_url: $base_url, pcr0: $pcr0, pcr1: $pcr1, pcr2: $pcr2, timestamp: $timestamp, commit: $commit, repo: $repo}' \
+            > deployment.json
+
+          # Create a timestamped release with the manifest attached.
+          gh release create "$TAG" deployment.json \
+            --title "Deploy ${TAG}" \
+            --notes "Deployed at ${TIMESTAMP} from commit ${COMMIT_SHA}.
+
+          **Elastic IP:** ${ELASTIC_IP}
+          **PCR0:** \` + "\\`" + `${PCR0}` + "\\`" + `"
+
+          # Update the 'latest' release so clients can always fetch the
+          # current manifest at releases/download/latest/deployment.json.
+          gh release delete latest --yes 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+          gh release create latest deployment.json \
+            --title "Latest Deployment" \
+            --notes "Current production deployment. Updated by each deploy.
+
+          **Elastic IP:** ${ELASTIC_IP}
+          **PCR0:** \` + "\\`" + `${PCR0}` + "\\`" + `
+          **Deployed:** ${TIMESTAMP}
+          **Commit:** ${COMMIT_SHA}"
 `
 
 // GitHub Actions workflow — destroy enclave infrastructure via OIDC-authenticated AWS credentials.
@@ -1058,25 +1117,21 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Create gh-pages branch if it doesn't exist yet
+          # Checkout gh-pages, preserving any existing files (e.g. deployment.json
+          # from the deploy workflow). Only update status.json and index.html.
           if ! git ls-remote --exit-code --heads origin gh-pages > /dev/null 2>&1; then
             git checkout --orphan gh-pages
             git rm -rf .
-            mkdir -p attestation
-            cp _site/index.html attestation/
-            cp _site/status.json attestation/
-            git add attestation/
-            git commit -m "attestation status page"
-            git push origin gh-pages
           else
             git fetch origin gh-pages
             git checkout gh-pages
-            mkdir -p attestation
-            cp _site/index.html attestation/
-            cp _site/status.json attestation/
-            git add attestation/
-            git diff --cached --quiet && exit 0
-            git commit -m "update attestation status"
-            git push origin gh-pages
           fi
+
+          mkdir -p attestation
+          cp _site/index.html attestation/
+          cp _site/status.json attestation/
+          git add attestation/index.html attestation/status.json
+          git diff --cached --quiet && exit 0
+          git commit -m "update attestation status"
+          git push origin gh-pages
 `

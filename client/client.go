@@ -7,16 +7,25 @@
 //
 // Usage:
 //
+//	// Option A: Manual configuration.
 //	c, err := client.New("https://1.2.3.4", client.Options{
 //	    ExpectedPCR0: "79f5fb125b00ad80...",
 //	    ExpectedPCRs: []string{"sha256-of-secret-pubkey"},
 //	})
+//
+//	// Option B: From deployment manifest (GitHub Releases).
+//	c, err := client.NewFromManifest(ctx,
+//	    client.ManifestURL("myorg/my-app", "latest"),
+//	    client.Options{},
+//	)
+//
 //	resp, err := c.Get(ctx, "/my-endpoint")
 package client
 
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -240,4 +249,79 @@ func (c *Client) url(path string) string {
 		path = "/" + path
 	}
 	return c.baseURL + path
+}
+
+// Manifest is the deployment metadata published by the deploy GitHub Actions
+// workflow as a GitHub Release asset (deployment.json).
+type Manifest struct {
+	BaseURL   string `json:"base_url"`
+	PCR0      string `json:"pcr0"`
+	PCR1      string `json:"pcr1"`
+	PCR2      string `json:"pcr2"`
+	Timestamp string `json:"timestamp"`
+	Commit    string `json:"commit"`
+	Repo      string `json:"repo"`
+}
+
+// ManifestURL returns the GitHub Releases URL for a repo's deployment manifest.
+// Use tag "latest" for the current deployment, or a specific deploy tag.
+//
+//	client.ManifestURL("myorg/my-app", "latest")
+//	// => "https://github.com/myorg/my-app/releases/download/latest/deployment.json"
+func ManifestURL(repo, tag string) string {
+	return "https://github.com/" + repo + "/releases/download/" + tag + "/deployment.json"
+}
+
+// FetchManifest fetches and parses a deployment manifest from the given URL.
+// Use ManifestURL to construct the URL from a GitHub repo and tag:
+//
+//	m, err := client.FetchManifest(ctx, client.ManifestURL("myorg/my-app", "latest"))
+func FetchManifest(ctx context.Context, manifestURL string) (*Manifest, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, manifestURL, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("fetch manifest: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("manifest status %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+
+	var m Manifest
+	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
+		return nil, fmt.Errorf("decode manifest: %w", err)
+	}
+
+	if m.BaseURL == "" {
+		return nil, fmt.Errorf("manifest missing base_url")
+	}
+	if m.PCR0 == "" {
+		return nil, fmt.Errorf("manifest missing pcr0")
+	}
+
+	return &m, nil
+}
+
+// NewFromManifest creates a client by fetching deployment metadata from a URL.
+// The manifest provides the enclave's base URL and PCR0, so callers only need
+// to know the manifest endpoint. Additional options (ExpectedPCRs, CacheTTL)
+// can be set to augment verification.
+func NewFromManifest(ctx context.Context, manifestURL string, opts Options) (*Client, error) {
+	m, err := FetchManifest(ctx, manifestURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch manifest: %w", err)
+	}
+
+	if opts.ExpectedPCR0 != "" && !strings.EqualFold(opts.ExpectedPCR0, m.PCR0) {
+		return nil, fmt.Errorf("manifest PCR0 %s does not match expected %s", m.PCR0, opts.ExpectedPCR0)
+	}
+	opts.ExpectedPCR0 = m.PCR0
+
+	return New(m.BaseURL, opts)
 }
